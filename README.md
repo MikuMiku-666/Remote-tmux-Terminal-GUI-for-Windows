@@ -11,6 +11,7 @@
 - `Close Remote` is the only action that kills the remote tmux terminal.
 - WebSocket streaming is used for terminal output, with instant snapshot resync after input.
 - Login info can be saved on Windows, including host, port, username, key path, password via DPAPI, and default terminal directory.
+- All commands can be entered in the input box at the bottom, or typed directly in the black area.
 - New in v14: Windows can set a default remote directory. When a new terminal is created, Linux starts the normal login-like shell first, then automatically sends one `cd -- <path>` command to the tmux pane.
 
 ## Linux server
