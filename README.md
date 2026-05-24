@@ -1,4 +1,4 @@
-# Remote tmux Terminal GUI
+# Remote tmux Terminal GUI for Windows
 
 ## What it does
 
