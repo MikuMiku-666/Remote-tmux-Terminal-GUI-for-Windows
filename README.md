@@ -1,6 +1,4 @@
-# Remote tmux Terminal v14 - Default Directory
-
-This version continues from the v11/v13 line and does **not** include the discarded v12 cursor renderer.
+# Remote tmux Terminal GUI
 
 ## What it does
 
