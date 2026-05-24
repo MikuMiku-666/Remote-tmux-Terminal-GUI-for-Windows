@@ -1,6 +1,6 @@
 # Remote tmux Terminal GUI for Windows
 
-!(UI)[UI.jpg]
+![UI](UI.jpg)
 
 ## What it does
 
