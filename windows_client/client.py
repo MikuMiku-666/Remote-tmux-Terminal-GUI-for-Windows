@@ -143,6 +143,21 @@ def save_default_cwd(default_cwd: str) -> None:
     save_client_config(data)
 
 
+def get_saved_font_size() -> int:
+    data = load_client_config()
+    try:
+        size = int(data.get("font_size", 10))
+    except Exception:
+        size = 10
+    return max(6, min(32, size))
+
+
+def save_font_size(size: int) -> None:
+    data = load_client_config()
+    data["font_size"] = max(6, min(32, int(size)))
+    save_client_config(data)
+
+
 def decrypt_saved_password(profile: Dict[str, Any]) -> str:
     payload = profile.get("password_dpapi")
     if not payload:
@@ -584,7 +599,7 @@ class TerminalTab:
             text_frame,
             wrap="none",
             state="disabled",
-            font=("Consolas", 10),
+            font=("Consolas", self.app.font_size),
             bg="#101010",
             fg="#eeeeee",
             insertbackground="#ffffff",
@@ -621,7 +636,7 @@ class TerminalTab:
 
         hint = ttk.Label(
             self.frame,
-            text="v14: WebSocket streaming based on v11/v13, with saved default remote directory. Click black area for interactive keys. Ctrl-C interrupts remote command; Ctrl+V pastes to remote.",
+            text="v15: Based on v11/v13/v14, adds adjustable terminal font size. Click black area for interactive keys. Ctrl-C interrupts remote command; Ctrl+V pastes to remote.",
             anchor="w",
         )
         hint.pack(side="bottom", fill="x")
@@ -629,6 +644,9 @@ class TerminalTab:
         app.notebook.add(self.frame, text=self.title[:18])
         app.notebook.select(self.frame)
         self.start_streaming()
+
+    def set_font_size(self, size: int) -> None:
+        self.text.configure(font=("Consolas", size))
 
     def _ws_url(self) -> str:
         if self.app.local_port is None:
@@ -862,9 +880,15 @@ class RemoteTerminalApp(tk.Tk):
         self.tabs: Dict[str, TerminalTab] = {}
         self.terminals: Dict[str, Dict[str, Any]] = {}
         self.default_cwd: str = get_saved_default_cwd()
+        self.font_size: int = get_saved_font_size()
         self.ui_queue: "queue.Queue[Any]" = queue.Queue()
 
         self._build_ui()
+        self.bind_all("<Control-plus>", lambda _e: self.increase_font_size())
+        self.bind_all("<Control-equal>", lambda _e: self.increase_font_size())
+        self.bind_all("<Control-minus>", lambda _e: self.decrease_font_size())
+        self.bind_all("<Control-KP_Add>", lambda _e: self.increase_font_size())
+        self.bind_all("<Control-KP_Subtract>", lambda _e: self.decrease_font_size())
         self.after(100, self.process_ui_queue)
         self.after(200, self.open_connection_dialog)
 
@@ -877,6 +901,21 @@ class RemoteTerminalApp(tk.Tk):
         ttk.Button(toolbar, text="Attach Selected", command=self.attach_selected).pack(side="left", padx=4, pady=4)
         ttk.Button(toolbar, text="Close Remote", command=self.close_remote_selected).pack(side="left", padx=4, pady=4)
         ttk.Button(toolbar, text="Set Default Dir", command=self.set_default_dir).pack(side="left", padx=4, pady=4)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=4, pady=4)
+        ttk.Button(toolbar, text="A-", width=3, command=self.decrease_font_size).pack(side="left", padx=(4, 1), pady=4)
+        self.font_size_var = tk.StringVar(value=str(self.font_size))
+        self.font_size_spin = ttk.Spinbox(
+            toolbar,
+            from_=6,
+            to=32,
+            width=4,
+            textvariable=self.font_size_var,
+            command=self.on_font_spinbox_changed,
+        )
+        self.font_size_spin.pack(side="left", padx=1, pady=4)
+        self.font_size_spin.bind("<Return>", lambda _e: self.on_font_spinbox_changed())
+        self.font_size_spin.bind("<FocusOut>", lambda _e: self.on_font_spinbox_changed())
+        ttk.Button(toolbar, text="A+", width=3, command=self.increase_font_size).pack(side="left", padx=(1, 4), pady=4)
         ttk.Button(toolbar, text="Forget Saved Login", command=self.forget_saved_login).pack(side="left", padx=4, pady=4)
 
         main = ttk.PanedWindow(self, orient="horizontal")
@@ -940,6 +979,36 @@ class RemoteTerminalApp(tk.Tk):
 
         self.set_status("Connecting over SSH...")
         threading.Thread(target=worker, name="connect-worker", daemon=True).start()
+
+    def apply_font_size(self, size: int) -> None:
+        self.font_size = max(6, min(32, int(size)))
+        try:
+            self.font_size_var.set(str(self.font_size))
+        except Exception:
+            pass
+        for tab in list(self.tabs.values()):
+            tab.set_font_size(self.font_size)
+        try:
+            save_font_size(self.font_size)
+        except Exception as exc:
+            messagebox.showwarning("Save font size failed", f"Could not save the font size:\n{exc}")
+        self.set_status(f"Terminal font size set to {self.font_size}. Shortcut: Ctrl+Plus / Ctrl+Minus.")
+
+    def on_font_spinbox_changed(self) -> None:
+        try:
+            size = int(str(self.font_size_var.get()).strip())
+        except Exception:
+            self.font_size_var.set(str(self.font_size))
+            return
+        self.apply_font_size(size)
+
+    def increase_font_size(self) -> str:
+        self.apply_font_size(self.font_size + 1)
+        return "break"
+
+    def decrease_font_size(self) -> str:
+        self.apply_font_size(self.font_size - 1)
+        return "break"
 
     def set_default_dir(self) -> None:
         value = simpledialog.askstring(
