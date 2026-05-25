@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 REM ---------------------------------------------------------------------------
-REM Windows launcher with ZERO third-party Python dependencies. v8 uses stdlib WebSocket streaming with smoother Enter rendering.
+REM Windows source launcher with ZERO third-party Python dependencies. v16 can also be packaged as EXE.
 REM It does not create .venv and does not run pip, avoiding pip/tomllib/proxy/
 REM cryptography/Rust DLL problems on Windows.
 REM ---------------------------------------------------------------------------

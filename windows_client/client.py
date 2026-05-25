@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows.
+No third-party Python dependencies on Windows source mode. v16 also supports PyInstaller EXE packaging.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -37,6 +37,19 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
+APP_VERSION = "v16: Based on v11/v13/v14/v15, adds Windows EXE packaging support; no v12 cursor."
+ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
+
+
+def log_error(text: str) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with ERROR_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 80 + "\n")
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+            f.write(text + "\n")
+    except Exception:
+        pass
 
 
 class DATA_BLOB(ctypes.Structure):
@@ -248,9 +261,23 @@ class SSHTunnel:
             cmd += ["-i", self.cfg.key_filename]
         cmd.append(target)
 
-        # Inherit the .bat console. If SSH password or host-key confirmation is
-        # needed, Windows will ask in that console window.
-        self.proc = subprocess.Popen(cmd)
+        # Source mode inherits the .bat console. In PyInstaller windowed EXE mode
+        # there is no parent console, so open a temporary SSH console when password
+        # login may need an interactive prompt. For key login, keep it hidden.
+        popen_kwargs: Dict[str, Any] = {}
+        if os.name == "nt":
+            # Accept a new host key automatically for the common first-run case.
+            # Existing changed host keys are still rejected by OpenSSH.
+            cmd[1:1] = ["-o", "StrictHostKeyChecking=accept-new"]
+            if self.cfg.password or not self.cfg.key_filename:
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            else:
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                popen_kwargs["stdin"] = subprocess.DEVNULL
+                popen_kwargs["stdout"] = subprocess.DEVNULL
+                popen_kwargs["stderr"] = subprocess.DEVNULL
+
+        self.proc = subprocess.Popen(cmd, **popen_kwargs)
         self.local_port = local_port
         time.sleep(0.8)
         if self.proc.poll() is not None:
@@ -636,7 +663,7 @@ class TerminalTab:
 
         hint = ttk.Label(
             self.frame,
-            text="v15: Based on v11/v13/v14, adds adjustable terminal font size. Click black area for interactive keys. Ctrl-C interrupts remote command; Ctrl+V pastes to remote.",
+            text=APP_VERSION + " Click black area for interactive keys. Ctrl-C interrupts remote command; Ctrl+V pastes to remote.",
             anchor="w",
         )
         hint.pack(side="bottom", fill="x")
@@ -1195,8 +1222,23 @@ class RemoteTerminalApp(tk.Tk):
 
 
 def main() -> None:
-    app = RemoteTerminalApp()
-    app.mainloop()
+    try:
+        app = RemoteTerminalApp()
+        app.mainloop()
+    except Exception:
+        err = traceback.format_exc()
+        log_error(err)
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Remote tmux Terminal crashed",
+                f"The Windows client crashed. Error log:\n{ERROR_LOG_FILE}\n\n{err}",
+            )
+            root.destroy()
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
