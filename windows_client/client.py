@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v18 also supports PyInstaller EXE packaging and multi-terminal close.
+No third-party Python dependencies on Windows source mode. v20 fixes black terminal copy/paste and keeps PyInstaller packaging and multi-terminal close.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -37,7 +37,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v19: Based on v18, adds optional hidden ssh.exe window; no v12 cursor."
+APP_VERSION = "v20: Based on v19, fixes terminal copy/paste; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -659,9 +659,30 @@ class TerminalTab:
         text_frame.rowconfigure(0, weight=1)
         text_frame.columnconfigure(0, weight=1)
         self.text.bind("<Button-1>", lambda _e: self.text.focus_set())
+        self.text.bind("<Button-3>", self.show_terminal_context_menu)
         self.text.bind("<KeyPress>", self.on_terminal_key)
+        # v20: explicit copy/paste bindings. The generic <KeyPress> handler
+        # deliberately intercepts Ctrl-C for remote SIGINT, so copy needs
+        # specific bindings and context-menu actions. Ctrl-C copies when a
+        # local selection exists; otherwise it still sends remote Ctrl-C.
+        self.text.bind("<Control-c>", self.on_terminal_ctrl_c)
+        self.text.bind("<Control-C>", self.on_terminal_ctrl_c)
+        self.text.bind("<Control-Shift-c>", self.on_terminal_copy)
+        self.text.bind("<Control-Shift-C>", self.on_terminal_copy)
+        self.text.bind("<Control-Insert>", self.on_terminal_copy)
         self.text.bind("<Control-v>", self.on_terminal_paste)
+        self.text.bind("<Control-V>", self.on_terminal_paste)
+        self.text.bind("<Shift-Insert>", self.on_terminal_paste)
+        self.text.bind("<<Copy>>", self.on_terminal_copy)
         self.text.bind("<<Paste>>", self.on_terminal_paste)
+
+        self.context_menu = tk.Menu(self.text, tearoff=0)
+        self.context_menu.add_command(label="Copy selected text", command=self.copy_selected_output)
+        self.context_menu.add_command(label="Copy all terminal output", command=self.copy_all_output)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Paste clipboard to remote", command=self.paste_clipboard_to_remote)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Select all", command=self.select_all_output)
 
         bottom = ttk.Frame(self.frame)
         bottom.pack(side="bottom", fill="x")
@@ -679,10 +700,12 @@ class TerminalTab:
         ttk.Button(bottom, text="Tab", command=lambda: self.send_key("Tab")).pack(side="left", padx=2)
         ttk.Button(bottom, text="Esc", command=lambda: self.send_key("Escape")).pack(side="left", padx=2)
         ttk.Button(bottom, text="Clear", command=lambda: self.send_key("C-l")).pack(side="left", padx=2)
+        ttk.Button(bottom, text="Copy Sel", command=self.copy_selected_output).pack(side="left", padx=2)
+        ttk.Button(bottom, text="Paste", command=self.paste_clipboard_to_remote).pack(side="left", padx=2)
 
         hint = ttk.Label(
             self.frame,
-            text=APP_VERSION + " Click black area for interactive keys. Ctrl-C interrupts remote command; Ctrl+V pastes to remote.",
+            text=APP_VERSION + " Click black area for interactive keys. Ctrl-C copies selected text; otherwise interrupts. Ctrl+V pastes to remote.",
             anchor="w",
         )
         hint.pack(side="bottom", fill="x")
@@ -827,29 +850,109 @@ class TerminalTab:
         self.send_key(key)
         return "break"
 
-    def on_terminal_paste(self, event: tk.Event) -> str:
+    def _has_selection(self) -> bool:
         try:
-            data = self.clipboard_get()
+            self.text.index("sel.first")
+            self.text.index("sel.last")
+            return True
         except Exception:
+            return False
+
+    def _get_selected_text(self) -> str:
+        try:
+            return self.text.get("sel.first", "sel.last")
+        except Exception:
+            return ""
+
+    def show_terminal_context_menu(self, event: tk.Event) -> str:
+        self.text.focus_set()
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.context_menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+    def copy_selected_output(self) -> str:
+        selected = self._get_selected_text()
+        if not selected:
+            self.app.set_status("No terminal text selected. Drag in the black area first, or use Copy all terminal output.")
             return "break"
+        try:
+            self.app.clipboard_clear()
+            self.app.clipboard_append(selected)
+            self.app.update_idletasks()
+            self.app.set_status(f"Copied {len(selected)} character(s) from terminal output.")
+        except Exception as exc:
+            self.app.set_status(f"Copy failed: {exc}")
+        return "break"
+
+    def copy_all_output(self) -> str:
+        try:
+            data = self.text.get("1.0", "end-1c")
+        except Exception:
+            data = ""
+        if not data:
+            self.app.set_status("Terminal output is empty; nothing to copy.")
+            return "break"
+        try:
+            self.app.clipboard_clear()
+            self.app.clipboard_append(data)
+            self.app.update_idletasks()
+            self.app.set_status(f"Copied all terminal output ({len(data)} character(s)).")
+        except Exception as exc:
+            self.app.set_status(f"Copy all failed: {exc}")
+        return "break"
+
+    def select_all_output(self) -> str:
+        try:
+            self.text.tag_add("sel", "1.0", "end-1c")
+            self.text.mark_set("insert", "1.0")
+            self.text.focus_set()
+            self.app.set_status("Selected all terminal output.")
+        except Exception as exc:
+            self.app.set_status(f"Select all failed: {exc}")
+        return "break"
+
+    def paste_clipboard_to_remote(self) -> str:
+        try:
+            data = self.app.clipboard_get()
+        except Exception:
+            self.app.set_status("Clipboard is empty or does not contain text.")
+            return "break"
+        data = data.replace("\r\n", "\n").replace("\r", "\n")
         if data:
             self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
+            self.app.set_status(f"Pasted {len(data)} character(s) to remote terminal.")
+        return "break"
+
+    def on_terminal_paste(self, event: tk.Event | None = None) -> str:
+        return self.paste_clipboard_to_remote()
+
+    def on_terminal_copy(self, event: tk.Event | None = None) -> str:
+        return self.copy_selected_output()
+
+    def on_terminal_ctrl_c(self, event: tk.Event | None = None) -> str:
+        # User-friendly behavior: if local terminal text is selected, Ctrl-C
+        # copies it; if nothing is selected, Ctrl-C remains remote SIGINT.
+        if self._has_selection():
+            return self.copy_selected_output()
+        self.send_key("C-c")
         return "break"
 
     def _copy_selection(self) -> str:
-        try:
-            selected = self.text.get("sel.first", "sel.last")
-        except Exception:
-            return "break"
-        self.clipboard_clear()
-        self.clipboard_append(selected)
-        return "break"
+        # Kept for backward compatibility with older handlers.
+        return self.copy_selected_output()
 
     def on_terminal_key(self, event: tk.Event) -> str:
         if (event.state & self.CTRL_MASK) and (event.state & self.SHIFT_MASK) and event.keysym.lower() == "c":
-            return self._copy_selection()
+            return self.copy_selected_output()
         if (event.state & self.CTRL_MASK) and event.keysym.lower() == "v":
-            return self.on_terminal_paste(event)
+            return self.paste_clipboard_to_remote()
+        if (event.state & self.CTRL_MASK) and event.keysym.lower() == "c":
+            return self.on_terminal_ctrl_c(event)
         if event.state & self.CTRL_MASK:
             key = self.CONTROL_KEYS.get(event.keysym.lower())
             if key:
