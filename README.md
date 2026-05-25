@@ -51,6 +51,11 @@ Run:
 ```bat
 windows_client\run_client.bat
 ```
+or just run:
+```
+windows_client\dist\RemoteTmuxTerminal.exe
+```
+which will need to show a ssh.exe window.
 
 Windows side does not need pip or third-party Python packages.
 
