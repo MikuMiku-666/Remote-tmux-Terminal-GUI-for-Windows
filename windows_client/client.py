@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v16 also supports PyInstaller EXE packaging.
+No third-party Python dependencies on Windows source mode. v18 also supports PyInstaller EXE packaging and multi-terminal close.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -37,7 +37,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v16: Based on v11/v13/v14/v15, adds Windows EXE packaging support; no v12 cursor."
+APP_VERSION = "v18: Based on v16, adds multi-select Close Remote; no v12 cursor and no v17 hidden ssh window."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -906,6 +906,7 @@ class RemoteTerminalApp(tk.Tk):
         self.local_port: Optional[int] = None
         self.tabs: Dict[str, TerminalTab] = {}
         self.terminals: Dict[str, Dict[str, Any]] = {}
+        self.terminal_order: list[str] = []
         self.default_cwd: str = get_saved_default_cwd()
         self.font_size: int = get_saved_font_size()
         self.ui_queue: "queue.Queue[Any]" = queue.Queue()
@@ -950,7 +951,7 @@ class RemoteTerminalApp(tk.Tk):
 
         left = ttk.Frame(main, width=240)
         ttk.Label(left, text="Remote tmux terminals").pack(side="top", anchor="w", padx=6, pady=4)
-        self.listbox = tk.Listbox(left)
+        self.listbox = tk.Listbox(left, selectmode="extended", exportselection=False)
         self.listbox.pack(side="top", fill="both", expand=True, padx=6, pady=4)
         self.listbox.bind("<Double-Button-1>", lambda _e: self.attach_selected())
         main.add(left, weight=1)
@@ -1080,11 +1081,12 @@ class RemoteTerminalApp(tk.Tk):
 
     def render_terminal_list(self, terminals: list[Dict[str, Any]]) -> None:
         self.terminals = {t["id"]: t for t in terminals}
+        self.terminal_order = [t["id"] for t in terminals]
         self.listbox.delete(0, "end")
         for t in terminals:
             label = f"{t.get('title', t['id'])}  [{t['id']}]"
             self.listbox.insert("end", label)
-        self.set_status(f"{len(terminals)} remote terminal(s). Double click to attach.")
+        self.set_status(f"{len(terminals)} remote terminal(s). Double click to attach. Multi-select on the left, then Close Remote to kill selected terminals.")
 
     def create_terminal(self) -> None:
         if self.api is None:
@@ -1118,10 +1120,33 @@ class RemoteTerminalApp(tk.Tk):
                     return term_id
             return None
         index = int(selection[0])
-        ids = list(self.terminals.keys())
+        ids = self.terminal_order
         if 0 <= index < len(ids):
             return ids[index]
         return None
+
+    def selected_terminal_ids(self) -> list[str]:
+        """Return all terminals selected in the left list.
+
+        If nothing is selected in the list, fall back to the currently active tab
+        so the old single-terminal Close Remote workflow still works.
+        """
+        selection = self.listbox.curselection()
+        result: list[str] = []
+        for raw_index in selection:
+            index = int(raw_index)
+            if 0 <= index < len(self.terminal_order):
+                term_id = self.terminal_order[index]
+                if term_id in self.terminals and term_id not in result:
+                    result.append(term_id)
+        if result:
+            return result
+
+        current = self.notebook.select()
+        for term_id, tab in self.tabs.items():
+            if str(tab.frame) == current:
+                return [term_id]
+        return []
 
     def attach_selected(self) -> None:
         term_id = self.selected_terminal_id()
@@ -1143,25 +1168,44 @@ class RemoteTerminalApp(tk.Tk):
     def close_remote_selected(self) -> None:
         if self.api is None:
             return
-        term_id = self.selected_terminal_id()
-        if term_id is None:
-            self.set_status("Select a remote terminal first.")
+        term_ids = self.selected_terminal_ids()
+        if not term_ids:
+            self.set_status("Select one or more remote terminals first.")
             return
-        title = self.terminals.get(term_id, {}).get("title", term_id)
-        if not messagebox.askyesno(
-            "Close remote terminal",
-            f"This will kill the Linux tmux terminal and stop its running command:\n\n{title}\n\nContinue?",
-        ):
+
+        titles = [self.terminals.get(term_id, {}).get("title", term_id) for term_id in term_ids]
+        if len(term_ids) == 1:
+            prompt = (
+                "This will kill the Linux tmux terminal and stop its running command:\n\n"
+                f"{titles[0]}\n\nContinue?"
+            )
+        else:
+            preview = "\n".join(f"- {title}" for title in titles[:12])
+            if len(titles) > 12:
+                preview += f"\n... and {len(titles) - 12} more"
+            prompt = (
+                f"This will kill {len(term_ids)} Linux tmux terminals and stop any running commands inside them:\n\n"
+                f"{preview}\n\nContinue?"
+            )
+
+        if not messagebox.askyesno("Close remote terminal(s)", prompt):
             return
 
         def worker() -> None:
-            try:
-                self.api.request("DELETE", f"/terminals/{urllib.parse.quote(term_id)}")
-                self.ui_queue.put(("closed_remote", term_id))
-            except Exception:
-                self.ui_queue.put(("error", traceback.format_exc()))
+            closed: list[str] = []
+            failed: list[str] = []
+            for term_id in term_ids:
+                try:
+                    self.api.request("DELETE", f"/terminals/{urllib.parse.quote(term_id)}")
+                    closed.append(term_id)
+                except Exception:
+                    failed.append(f"{term_id}: {traceback.format_exc()}")
+            if closed:
+                self.ui_queue.put(("closed_remote_many", closed))
+            if failed:
+                self.ui_queue.put(("error", "Some terminals failed to close:\n" + "\n".join(failed)))
 
-        threading.Thread(target=worker, name="delete-worker", daemon=True).start()
+        threading.Thread(target=worker, name="delete-many-worker", daemon=True).start()
 
     def process_ui_queue(self) -> None:
         try:
@@ -1192,6 +1236,15 @@ class RemoteTerminalApp(tk.Tk):
                         tab = self.tabs.pop(term_id)
                         tab.detach()
                         self.notebook.forget(tab.frame)
+                    self.refresh_terminals()
+                elif kind == "closed_remote_many":
+                    closed_ids = item[1]
+                    for term_id in closed_ids:
+                        if term_id in self.tabs:
+                            tab = self.tabs.pop(term_id)
+                            tab.detach()
+                            self.notebook.forget(tab.frame)
+                    self.set_status(f"Closed {len(closed_ids)} remote terminal(s).")
                     self.refresh_terminals()
                 elif kind == "snapshot":
                     _kind, term_id, data = item
