@@ -37,7 +37,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v18: Based on v16, adds multi-select Close Remote; no v12 cursor and no v17 hidden ssh window."
+APP_VERSION = "v19: Based on v18, adds optional hidden ssh.exe window; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -192,6 +192,7 @@ def save_connection_profile(cfg: "SSHConfig", *, remember_login: bool, save_pass
         "key_filename": cfg.key_filename,
         "remote_port": cfg.remote_port,
         "default_cwd": cfg.default_cwd,
+        "hide_ssh_window": bool(cfg.hide_ssh_window),
         "save_password": bool(save_password),
         "updated_at": int(time.time()),
     }
@@ -213,6 +214,7 @@ class SSHConfig:
     remote_host: str = "127.0.0.1"
     remote_port: int = 8765
     default_cwd: str = ""
+    hide_ssh_window: bool = False
     local_host: str = "127.0.0.1"
     local_port: int = 0
 
@@ -261,15 +263,22 @@ class SSHTunnel:
             cmd += ["-i", self.cfg.key_filename]
         cmd.append(target)
 
-        # Source mode inherits the .bat console. In PyInstaller windowed EXE mode
-        # there is no parent console, so open a temporary SSH console when password
-        # login may need an interactive prompt. For key login, keep it hidden.
+        # v19: optional hidden ssh.exe console window.
+        # Hidden mode uses BatchMode=yes + CREATE_NO_WINDOW, so it is suitable for
+        # SSH key / ssh-agent login. Password-only login still needs the visible
+        # ssh.exe console, otherwise there is nowhere to type the password.
         popen_kwargs: Dict[str, Any] = {}
         if os.name == "nt":
             # Accept a new host key automatically for the common first-run case.
             # Existing changed host keys are still rejected by OpenSSH.
             cmd[1:1] = ["-o", "StrictHostKeyChecking=accept-new"]
-            if self.cfg.password or not self.cfg.key_filename:
+            if self.cfg.hide_ssh_window:
+                cmd[1:1] = ["-o", "BatchMode=yes"]
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                popen_kwargs["stdin"] = subprocess.DEVNULL
+                popen_kwargs["stdout"] = subprocess.DEVNULL
+                popen_kwargs["stderr"] = subprocess.DEVNULL
+            elif self.cfg.password or not self.cfg.key_filename:
                 popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
             else:
                 popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -329,8 +338,10 @@ class ConnectDialog(simpledialog.Dialog):
         }
         self.remember_var = tk.BooleanVar(value=True)
         self.save_password_var = tk.BooleanVar(value=bool(saved_profile.get("save_password") and saved_password))
+        self.hide_ssh_window_var = tk.BooleanVar(value=bool(saved_profile.get("hide_ssh_window", False)))
         self.remember_login = True
         self.save_password = False
+        self.hide_ssh_window = False
 
         first: Optional[ttk.Entry] = None
         for row, (label, key) in enumerate(labels):
@@ -354,9 +365,15 @@ class ConnectDialog(simpledialog.Dialog):
             variable=self.save_password_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         row += 1
+        ttk.Checkbutton(
+            master,
+            text="Hide ssh.exe console window (recommended with SSH key / ssh-agent)",
+            variable=self.hide_ssh_window_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        row += 1
         ttk.Label(
             master,
-            text="Note: Windows ssh.exe does not accept passwords from this GUI. If a password is saved, it will be copied to clipboard when connecting; paste it into the SSH console if asked. SSH key login is still recommended.",
+            text="Note: Hidden mode removes the ssh.exe popup, but password-only SSH cannot be typed while hidden. Use SSH key / ssh-agent, or uncheck this option to show the password console.",
             wraplength=430,
             foreground="#666666",
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
@@ -374,6 +391,7 @@ class ConnectDialog(simpledialog.Dialog):
                 raise ValueError("SSH Host and Username are required")
             self.remember_login = bool(self.remember_var.get())
             self.save_password = bool(self.save_password_var.get())
+            self.hide_ssh_window = bool(self.hide_ssh_window_var.get())
             self.result = SSHConfig(
                 host=host,
                 port=port,
@@ -382,6 +400,7 @@ class ConnectDialog(simpledialog.Dialog):
                 key_filename=self.vars["key"].get().strip(),
                 remote_port=remote_port,
                 default_cwd=self.vars["default_cwd"].get().strip(),
+                hide_ssh_window=self.hide_ssh_window,
             )
             return True
         except Exception as exc:
@@ -983,7 +1002,7 @@ class RemoteTerminalApp(tk.Tk):
         except Exception as exc:
             messagebox.showwarning("Save login failed", f"Could not save the login profile:\n{exc}")
 
-        if cfg.password:
+        if cfg.password and not cfg.hide_ssh_window:
             # ssh.exe will not accept the password through stdin; it asks in its own console.
             # Copying helps the common password-login workflow while avoiding extra dependencies.
             try:
@@ -992,6 +1011,8 @@ class RemoteTerminalApp(tk.Tk):
                 self.set_status("Password copied to clipboard. Paste it into the SSH console if prompted.")
             except Exception:
                 pass
+        elif cfg.password and cfg.hide_ssh_window and not cfg.key_filename:
+            self.set_status("Hidden SSH mode enabled. Password is saved but cannot be typed into hidden ssh.exe; use SSH key / ssh-agent or uncheck Hide.")
 
         def worker() -> None:
             try:
