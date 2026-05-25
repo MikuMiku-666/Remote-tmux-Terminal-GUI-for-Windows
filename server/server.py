@@ -308,6 +308,7 @@ def send_tmux_key(term_id: str, key: str) -> None:
         "C-c",
         "C-d",
         "C-z",
+        "C-v",
         "C-l",
         "C-a",
         "C-e",
