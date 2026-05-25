@@ -69,7 +69,7 @@ You can set the default directory in two places:
 Example:
 
 ```text
-/new_data/lzy/my_project
+/data/miku/my_project
 ```
 
 When you create a new terminal, the server does this conceptually:
@@ -77,7 +77,7 @@ When you create a new terminal, the server does this conceptually:
 ```bash
 # normal SSH-like shell startup first
 # then automatically:
-cd -- /new_data/lzy/my_project
+cd -- /data/miku/my_project
 ```
 
 Leaving the field empty means new terminals use the normal login directory.
