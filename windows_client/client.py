@@ -22,6 +22,8 @@ import struct
 import threading
 import subprocess
 import shutil
+import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -37,7 +39,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v21: Based on v20, adds Send Raw Ctrl-V; no v12 cursor."
+APP_VERSION = "v22: Based on v21, adds SSH_ASKPASS password auto-fill; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -116,6 +118,68 @@ def _dpapi_decrypt(encoded: str) -> bytes:
     finally:
         if out_blob.pbData:
             kernel32.LocalFree(out_blob.pbData)
+
+
+
+
+def is_frozen_exe() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def run_askpass_helper_if_requested() -> None:
+    """When OpenSSH invokes this program as SSH_ASKPASS, print the password.
+
+    In packaged EXE mode, SSH_ASKPASS points directly to RemoteTmuxTerminal.exe.
+    OpenSSH calls it with a prompt argument. The marker environment variable below
+    makes this process behave as a tiny askpass helper instead of opening the GUI.
+    The password is passed as a DPAPI-encrypted environment value, so it is not
+    exposed as a command-line argument.
+    """
+    if os.environ.get("RTERM_ASKPASS_MODE") != "1":
+        return
+    try:
+        payload = os.environ.get("RTERM_ASKPASS_DPAPI", "")
+        if payload:
+            sys.stdout.write(_dpapi_decrypt(payload).decode("utf-8", errors="replace"))
+    except Exception:
+        # Askpass helpers should fail quietly; ssh will report authentication failure.
+        pass
+    sys.stdout.flush()
+    raise SystemExit(0)
+
+
+def get_askpass_program() -> str:
+    """Return an executable path suitable for SSH_ASKPASS.
+
+    Packaged mode is clean: RemoteTmuxTerminal.exe can run as its own helper.
+    Source mode creates a small cmd launcher that re-enters this script. This is
+    mainly for development; the packaged EXE path is the recommended mode.
+    """
+    if is_frozen_exe():
+        return sys.executable
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    helper = CONFIG_DIR / "rterm_askpass.cmd"
+    script = Path(__file__).resolve()
+    python_exe = Path(sys.executable).resolve()
+    helper.write_text(
+        "@echo off\r\n"
+        f'"{python_exe}" "{script}" --askpass %*\r\n',
+        encoding="utf-8",
+    )
+    return str(helper)
+
+
+def build_askpass_env(password: str) -> Dict[str, str]:
+    env = os.environ.copy()
+    env["RTERM_ASKPASS_MODE"] = "1"
+    env["RTERM_ASKPASS_DPAPI"] = _dpapi_encrypt(password.encode("utf-8"))
+    env["SSH_ASKPASS"] = get_askpass_program()
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    # Some OpenSSH builds historically required DISPLAY to decide that askpass
+    # is available. The value is not used on Windows, but setting it is harmless.
+    env.setdefault("DISPLAY", "rterm:0")
+    return env
 
 
 def load_client_config() -> Dict[str, Any]:
@@ -273,11 +337,21 @@ class SSHTunnel:
             # Existing changed host keys are still rejected by OpenSSH.
             cmd[1:1] = ["-o", "StrictHostKeyChecking=accept-new"]
             if self.cfg.hide_ssh_window:
-                cmd[1:1] = ["-o", "BatchMode=yes"]
                 popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 popen_kwargs["stdin"] = subprocess.DEVNULL
                 popen_kwargs["stdout"] = subprocess.DEVNULL
                 popen_kwargs["stderr"] = subprocess.DEVNULL
+                if self.cfg.password:
+                    # v22: hidden password login via OpenSSH askpass. Do not set
+                    # BatchMode=yes here; BatchMode disables password prompts.
+                    # SSH_ASKPASS_REQUIRE=force makes ssh ask the helper instead
+                    # of opening a console prompt.
+                    popen_kwargs["env"] = build_askpass_env(self.cfg.password)
+                    cmd[1:1] = ["-o", "NumberOfPasswordPrompts=1"]
+                else:
+                    # Key/agent hidden mode should fail fast instead of waiting
+                    # for an invisible prompt.
+                    cmd[1:1] = ["-o", "BatchMode=yes"]
             elif self.cfg.password or not self.cfg.key_filename:
                 popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
             else:
@@ -367,13 +441,13 @@ class ConnectDialog(simpledialog.Dialog):
         row += 1
         ttk.Checkbutton(
             master,
-            text="Hide ssh.exe console window (recommended with SSH key / ssh-agent)",
+            text="Hide ssh.exe console window / auto-fill password with SSH_ASKPASS",
             variable=self.hide_ssh_window_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         row += 1
         ttk.Label(
             master,
-            text="Note: Hidden mode removes the ssh.exe popup, but password-only SSH cannot be typed while hidden. Use SSH key / ssh-agent, or uncheck this option to show the password console.",
+            text="Note: In hidden mode, SSH key / ssh-agent works normally. If a password is provided, the client tries to pass it to OpenSSH through SSH_ASKPASS automatically. If authentication fails, uncheck this option to use the visible ssh.exe password console.",
             wraplength=430,
             foreground="#666666",
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
@@ -1125,15 +1199,15 @@ class RemoteTerminalApp(tk.Tk):
 
         if cfg.password and not cfg.hide_ssh_window:
             # ssh.exe will not accept the password through stdin; it asks in its own console.
-            # Copying helps the common password-login workflow while avoiding extra dependencies.
+            # Copying helps the visible-console password-login workflow while avoiding extra dependencies.
             try:
                 self.clipboard_clear()
                 self.clipboard_append(cfg.password)
                 self.set_status("Password copied to clipboard. Paste it into the SSH console if prompted.")
             except Exception:
                 pass
-        elif cfg.password and cfg.hide_ssh_window and not cfg.key_filename:
-            self.set_status("Hidden SSH mode enabled. Password is saved but cannot be typed into hidden ssh.exe; use SSH key / ssh-agent or uncheck Hide.")
+        elif cfg.password and cfg.hide_ssh_window:
+            self.set_status("Hidden SSH mode enabled. The client will try SSH_ASKPASS password auto-fill.")
 
         def worker() -> None:
             try:
@@ -1437,4 +1511,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_askpass_helper_if_requested()
     main()
