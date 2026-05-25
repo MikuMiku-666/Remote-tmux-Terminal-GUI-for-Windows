@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v20 fixes black terminal copy/paste and keeps PyInstaller packaging and multi-terminal close.
+No third-party Python dependencies on Windows source mode. v21 keeps black terminal copy/paste and adds Send Raw Ctrl-V for quoted-insert workflows.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -37,7 +37,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v20: Based on v19, fixes terminal copy/paste; no v12 cursor."
+APP_VERSION = "v21: Based on v20, adds Send Raw Ctrl-V; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -618,6 +618,7 @@ class TerminalTab:
 
     CTRL_MASK = 0x0004
     SHIFT_MASK = 0x0001
+    ALT_MASK = 0x0008
     MAX_TEXT_LINES = 12000
 
     def __init__(self, app: "RemoteTerminalApp", info: Dict[str, Any]) -> None:
@@ -672,6 +673,8 @@ class TerminalTab:
         self.text.bind("<Control-Insert>", self.on_terminal_copy)
         self.text.bind("<Control-v>", self.on_terminal_paste)
         self.text.bind("<Control-V>", self.on_terminal_paste)
+        self.text.bind("<Control-Alt-v>", self.on_terminal_raw_ctrl_v)
+        self.text.bind("<Control-Alt-V>", self.on_terminal_raw_ctrl_v)
         self.text.bind("<Shift-Insert>", self.on_terminal_paste)
         self.text.bind("<<Copy>>", self.on_terminal_copy)
         self.text.bind("<<Paste>>", self.on_terminal_paste)
@@ -681,6 +684,7 @@ class TerminalTab:
         self.context_menu.add_command(label="Copy all terminal output", command=self.copy_all_output)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Paste clipboard to remote", command=self.paste_clipboard_to_remote)
+        self.context_menu.add_command(label="Send Raw Ctrl-V to remote", command=self.send_raw_ctrl_v)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Select all", command=self.select_all_output)
 
@@ -702,10 +706,11 @@ class TerminalTab:
         ttk.Button(bottom, text="Clear", command=lambda: self.send_key("C-l")).pack(side="left", padx=2)
         ttk.Button(bottom, text="Copy Sel", command=self.copy_selected_output).pack(side="left", padx=2)
         ttk.Button(bottom, text="Paste", command=self.paste_clipboard_to_remote).pack(side="left", padx=2)
+        ttk.Button(bottom, text="Raw C-V", command=self.send_raw_ctrl_v).pack(side="left", padx=2)
 
         hint = ttk.Label(
             self.frame,
-            text=APP_VERSION + " Click black area for interactive keys. Ctrl-C copies selected text; otherwise interrupts. Ctrl+V pastes to remote.",
+            text=APP_VERSION + " Click black area for interactive keys. Ctrl-C copies selected text; otherwise interrupts. Ctrl+V pastes; Ctrl+Alt+V sends raw Ctrl-V.",
             anchor="w",
         )
         hint.pack(side="bottom", fill="x")
@@ -931,6 +936,17 @@ class TerminalTab:
     def on_terminal_paste(self, event: tk.Event | None = None) -> str:
         return self.paste_clipboard_to_remote()
 
+    def send_raw_ctrl_v(self) -> str:
+        # Linux/readline uses Ctrl-V as quoted-insert. Keep Ctrl+V as a
+        # Windows-friendly paste shortcut, but provide this escape hatch for
+        # cases where the remote program must receive the real Ctrl-V key.
+        self.send_key("C-v")
+        self.app.set_status("Sent raw Ctrl-V to remote terminal.")
+        return "break"
+
+    def on_terminal_raw_ctrl_v(self, event: tk.Event | None = None) -> str:
+        return self.send_raw_ctrl_v()
+
     def on_terminal_copy(self, event: tk.Event | None = None) -> str:
         return self.copy_selected_output()
 
@@ -947,6 +963,8 @@ class TerminalTab:
         return self.copy_selected_output()
 
     def on_terminal_key(self, event: tk.Event) -> str:
+        if (event.state & self.CTRL_MASK) and (event.state & self.ALT_MASK) and event.keysym.lower() == "v":
+            return self.send_raw_ctrl_v()
         if (event.state & self.CTRL_MASK) and (event.state & self.SHIFT_MASK) and event.keysym.lower() == "c":
             return self.copy_selected_output()
         if (event.state & self.CTRL_MASK) and event.keysym.lower() == "v":
