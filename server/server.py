@@ -387,7 +387,7 @@ def normalize_stream_text(text: str) -> str:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     ensure_tmux()
-    return {"ok": True, "app": APP_NAME, "version": "v14-default-dir", "tmux": True, "time": time.time()}
+    return {"ok": True, "app": APP_NAME, "version": "v23-dirty-resync", "tmux": True, "time": time.time()}
 
 
 @app.get("/terminals")
@@ -508,6 +508,13 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
 
     stop = asyncio.Event()
     output_queue: "asyncio.Queue[str]" = asyncio.Queue()
+    # v23: same-line redraws such as tqdm/progress bars can update the tmux
+    # pane without producing a visually correct append-only stream in the
+    # lightweight Windows renderer.  A dirty-screen watcher checks the actual
+    # tmux pane content at a short interval and pushes a snapshot immediately
+    # when the rendered content changes.  This replaces the old user-visible
+    # 1.5s correction delay with near-real-time server-side push.
+    dirty_event = asyncio.Event()
     proc: asyncio.subprocess.Process | None = None
     send_lock = asyncio.Lock()
 
@@ -559,6 +566,7 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
                     decoded = normalize_stream_text(decode_tmux_control_payload(parts[2]))
                     if decoded:
                         await output_queue.put(decoded)
+                        dirty_event.set()
             elif line.startswith("%exit"):
                 break
             # Other control-mode records such as %begin/%end/%layout-change are
@@ -582,11 +590,39 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
             if data:
                 await safe_send({"type": "output", "id": term_id, "data": data})
 
-    async def snapshot_resync() -> None:
-        """Send a full rendered pane occasionally for reconnect and correction."""
-        last = None
+    async def screen_change_pusher() -> None:
+        """Push a full pane snapshot whenever the rendered tmux screen changes.
+
+        Incremental %output is still useful for low-latency append-only text,
+        but progress bars, tqdm, carriage-return redraws, and some ANSI cursor
+        updates are screen-state changes rather than clean append operations.
+        The Windows client is intentionally lightweight and does not implement
+        a full xterm renderer, so the authoritative state is tmux capture-pane.
+
+        v23 watches that authoritative pane state on the server side and sends
+        a snapshot only when the captured content actually differs. This gives
+        near-real-time tqdm/progress updates without Windows HTTP polling.
+        Tuning:
+          RTERM_SCREEN_PUSH_INTERVAL=0.10   # seconds, default 0.10
+        """
+        try:
+            interval = float(os.environ.get("RTERM_SCREEN_PUSH_INTERVAL", "0.10"))
+        except Exception:
+            interval = 0.10
+        interval = max(0.05, min(2.0, interval))
+
+        last: str | None = None
         while not stop.is_set():
             try:
+                # Wake quickly when tmux control mode reports output, but also
+                # scan on a short timeout to catch screen changes that do not
+                # become useful append-only stream text.
+                try:
+                    await asyncio.wait_for(dirty_event.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+                dirty_event.clear()
+
                 current = await asyncio.to_thread(capture_pane, term_id)
                 if current != last:
                     last = current
@@ -595,9 +631,10 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
                 await safe_send({"type": "error", "message": str(exc)})
                 stop.set()
                 break
-            # Much lower than old HTTP polling. Incremental output handles the
-            # live stream; this only corrects the rendered text every 1.5 seconds.
-            await asyncio.sleep(1.5)
+
+            # Hard rate limit. For rapidly changing progress bars this is the
+            # maximum push rate; unchanged screens send nothing.
+            await asyncio.sleep(interval)
 
     async def receiver() -> None:
         while not stop.is_set():
@@ -642,7 +679,7 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
     tasks = [
         asyncio.create_task(control_reader()),
         asyncio.create_task(output_flusher()),
-        asyncio.create_task(snapshot_resync()),
+        asyncio.create_task(screen_change_pusher()),
         asyncio.create_task(receiver()),
     ]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
