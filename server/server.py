@@ -245,6 +245,47 @@ def capture_pane(term_id: str, scrollback: int = 5000) -> str:
     return cp.stdout.rstrip("\n")
 
 
+def get_cursor_info(term_id: str) -> Dict[str, int] | None:
+    """Return tmux pane cursor metadata for lightweight client highlighting.
+
+    pane_cursor_x/y are 0-based coordinates inside the visible pane, not the
+    full scrollback captured by capture-pane. The Windows client maps them onto
+    the last pane_height lines of the snapshot and underlines the character at
+    that approximate position. This is intentionally a small cursor hint, not a
+    full xterm cursor implementation.
+    """
+    name = session_name(term_id)
+    if not tmux_session_exists(name):
+        raise HTTPException(status_code=404, detail="Terminal does not exist")
+    cp = run_cmd(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            name,
+            "#{pane_cursor_x}\t#{pane_cursor_y}\t#{pane_width}\t#{pane_height}",
+        ],
+        timeout=2.0,
+        check=False,
+    )
+    if cp.returncode != 0:
+        return None
+    parts = cp.stdout.strip().split("\t")
+    if len(parts) < 4:
+        return None
+    try:
+        x, y, width, height = [int(v) for v in parts[:4]]
+        return {"x": x, "y": y, "width": width, "height": height}
+    except Exception:
+        return None
+
+
+def capture_screen_state(term_id: str, scrollback: int = 5000) -> Dict[str, Any]:
+    """Capture the authoritative pane text plus cursor metadata."""
+    return {"data": capture_pane(term_id, scrollback=scrollback), "cursor": get_cursor_info(term_id)}
+
+
 def send_text(term_id: str, data: str) -> None:
     name = session_name(term_id)
     if not tmux_session_exists(name):
@@ -387,7 +428,7 @@ def normalize_stream_text(text: str) -> str:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     ensure_tmux()
-    return {"ok": True, "app": APP_NAME, "version": "v23-dirty-resync", "tmux": True, "time": time.time()}
+    return {"ok": True, "app": APP_NAME, "version": "v24-adaptive-cursor", "tmux": True, "time": time.time()}
 
 
 @app.get("/terminals")
@@ -463,7 +504,8 @@ def kill_terminal(term_id: str) -> Dict[str, Any]:
 @app.get("/terminals/{term_id}/snapshot")
 def snapshot(term_id: str) -> Dict[str, Any]:
     validate_id(term_id)
-    return {"id": term_id, "data": capture_pane(term_id)}
+    state = capture_screen_state(term_id)
+    return {"id": term_id, **state}
 
 
 @app.post("/terminals/{term_id}/input")
@@ -517,6 +559,10 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
     dirty_event = asyncio.Event()
     proc: asyncio.subprocess.Process | None = None
     send_lock = asyncio.Lock()
+    # The Windows client reports whether this tab is the active visible tab.
+    # Active tabs get fast progress/tqdm updates; inactive tabs back off to a
+    # slower cadence to reduce long-running server overhead.
+    client_active = True
 
     async def safe_send(payload: Dict[str, Any]) -> None:
         # Several tasks can send concurrently: tmux stream flushing, periodic
@@ -526,8 +572,8 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
             await ws.send_text(json.dumps(payload, ensure_ascii=False))
 
     async def send_snapshot_now() -> None:
-        current = await asyncio.to_thread(capture_pane, term_id)
-        await safe_send({"type": "snapshot", "id": term_id, "data": current})
+        state = await asyncio.to_thread(capture_screen_state, term_id)
+        await safe_send({"type": "snapshot", "id": term_id, **state})
 
     async def control_reader() -> None:
         """Read incremental pane output from `tmux -C attach-session`."""
@@ -591,52 +637,83 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
                 await safe_send({"type": "output", "id": term_id, "data": data})
 
     async def screen_change_pusher() -> None:
-        """Push a full pane snapshot whenever the rendered tmux screen changes.
+        """Push snapshots adaptively when the tmux screen changes.
 
-        Incremental %output is still useful for low-latency append-only text,
-        but progress bars, tqdm, carriage-return redraws, and some ANSI cursor
-        updates are screen-state changes rather than clean append operations.
-        The Windows client is intentionally lightweight and does not implement
-        a full xterm renderer, so the authoritative state is tmux capture-pane.
+        v23 used a fixed short interval so tqdm/progress bars were corrected
+        quickly. v24 keeps the same responsiveness while reducing long-running
+        overhead:
+          - after recent output/change: high-frequency checks (default 0.10s);
+          - after a few idle seconds: slow checks (default 0.75s);
+          - when the Windows tab/window is inactive: slower checks (default 1.00s);
+          - when the WebSocket disconnects: this task is cancelled/stopped.
 
-        v23 watches that authoritative pane state on the server side and sends
-        a snapshot only when the captured content actually differs. This gives
-        near-real-time tqdm/progress updates without Windows HTTP polling.
-        Tuning:
-          RTERM_SCREEN_PUSH_INTERVAL=0.10   # seconds, default 0.10
+        Environment tuning:
+          RTERM_SCREEN_PUSH_INTERVAL=0.10          # legacy alias for fast
+          RTERM_SCREEN_PUSH_FAST_INTERVAL=0.10
+          RTERM_SCREEN_PUSH_IDLE_INTERVAL=0.75
+          RTERM_SCREEN_PUSH_INACTIVE_INTERVAL=1.00
+          RTERM_SCREEN_PUSH_IDLE_AFTER=2.50
         """
-        try:
-            interval = float(os.environ.get("RTERM_SCREEN_PUSH_INTERVAL", "0.10"))
-        except Exception:
-            interval = 0.10
-        interval = max(0.05, min(2.0, interval))
+        def read_float(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                value = float(os.environ.get(name, str(default)))
+            except Exception:
+                value = default
+            return max(lo, min(hi, value))
 
-        last: str | None = None
+        fast_default = read_float("RTERM_SCREEN_PUSH_INTERVAL", 0.10, 0.03, 2.0)
+        fast_interval = read_float("RTERM_SCREEN_PUSH_FAST_INTERVAL", fast_default, 0.03, 2.0)
+        idle_interval = read_float("RTERM_SCREEN_PUSH_IDLE_INTERVAL", 0.75, fast_interval, 5.0)
+        inactive_interval = read_float("RTERM_SCREEN_PUSH_INACTIVE_INTERVAL", 1.00, fast_interval, 10.0)
+        idle_after = read_float("RTERM_SCREEN_PUSH_IDLE_AFTER", 2.50, 0.2, 30.0)
+
+        last_state: Dict[str, Any] | None = None
+        last_change_time = time.monotonic()
+
         while not stop.is_set():
             try:
-                # Wake quickly when tmux control mode reports output, but also
-                # scan on a short timeout to catch screen changes that do not
-                # become useful append-only stream text.
+                now = time.monotonic()
+                if not client_active:
+                    interval = inactive_interval
+                elif now - last_change_time <= idle_after:
+                    interval = fast_interval
+                else:
+                    interval = idle_interval
+
+                # Wake immediately when tmux control mode reports output, but
+                # still scan on timeout to catch redraw-only changes.
                 try:
                     await asyncio.wait_for(dirty_event.wait(), timeout=interval)
                 except asyncio.TimeoutError:
                     pass
                 dirty_event.clear()
 
-                current = await asyncio.to_thread(capture_pane, term_id)
-                if current != last:
-                    last = current
-                    await safe_send({"type": "snapshot", "id": term_id, "data": current})
+                state = await asyncio.to_thread(capture_screen_state, term_id)
+                # Compare both data and cursor. This lets simple cursor movement
+                # after input update the underline hint even if the text is same.
+                comparable = {"data": state.get("data", ""), "cursor": state.get("cursor")}
+                if comparable != last_state:
+                    last_state = comparable
+                    last_change_time = time.monotonic()
+                    await safe_send({"type": "snapshot", "id": term_id, **state})
             except Exception as exc:
                 await safe_send({"type": "error", "message": str(exc)})
                 stop.set()
                 break
 
-            # Hard rate limit. For rapidly changing progress bars this is the
-            # maximum push rate; unchanged screens send nothing.
-            await asyncio.sleep(interval)
+            # Hard rate limit based on the current state. This is what keeps a
+            # busy progress bar smooth while letting idle/inactive tabs back off.
+            now = time.monotonic()
+            if not client_active:
+                sleep_for = inactive_interval
+            elif now - last_change_time <= idle_after:
+                sleep_for = fast_interval
+            else:
+                sleep_for = idle_interval
+            await asyncio.sleep(sleep_for)
 
     async def receiver() -> None:
+        nonlocal client_active
         while not stop.is_set():
             try:
                 raw = await ws.receive_text()
@@ -663,6 +740,9 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
                     await asyncio.to_thread(kill_terminal, term_id)
                     stop.set()
                     break
+                elif typ == "active":
+                    client_active = bool(msg.get("active", True))
+                    dirty_event.set()
                 elif typ == "ping":
                     await safe_send({"type": "pong", "time": time.time()})
             except Exception as exc:

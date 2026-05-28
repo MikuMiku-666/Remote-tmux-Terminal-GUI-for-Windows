@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v21 keeps black terminal copy/paste and adds Send Raw Ctrl-V for quoted-insert workflows.
+No third-party Python dependencies on Windows source mode. v24 adds adaptive dirty-screen push and a static underline cursor hint.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -39,7 +39,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v22: Based on v21, adds SSH_ASKPASS password auto-fill; no v12 cursor."
+APP_VERSION = "v24: adaptive dirty-screen push + static underline cursor hint; includes v22 SSH_ASKPASS; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -713,6 +713,9 @@ class TerminalTab:
         # prevents freshly typed text from appearing separated from the prompt
         # until the periodic resync catches up.
         self.suppress_output_until = 0.0
+        # v24: server-side watcher backs off for inactive tabs. The app updates
+        # this flag when the notebook selection or window focus changes.
+        self.is_active_tab = False
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(side="top", fill="both", expand=True)
@@ -728,6 +731,10 @@ class TerminalTab:
         self.v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.text.yview)
         self.h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.text.xview)
         self.text.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
+        # v24: a non-blinking, non-copying cursor hint. It underlines the
+        # character at tmux's pane_cursor_x/y when snapshots include cursor
+        # metadata. This is intentionally not the discarded v12 fake cursor.
+        self.text.tag_configure("cursor_hint", underline=True)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
@@ -792,6 +799,29 @@ class TerminalTab:
         app.notebook.add(self.frame, text=self.title[:18])
         app.notebook.select(self.frame)
         self.start_streaming()
+        # Notify the server after the websocket connects that this newly opened
+        # tab is probably active; RemoteTerminalApp will refine all tab states.
+        self.set_active(True)
+
+    def set_active(self, active: bool) -> None:
+        """Tell the Linux server whether this attached tab is actively visible.
+
+        v24 uses this to keep active tabs smooth while inactive tabs poll the
+        tmux pane much less often. The remote terminal itself continues running
+        regardless of this flag.
+        """
+        self.is_active_tab = bool(active)
+        self._send_active_state()
+
+    def _send_active_state(self) -> None:
+        with self.ws_lock:
+            ws = self.ws
+        if ws is None:
+            return
+        try:
+            ws.send_text(json.dumps({"type": "active", "active": bool(self.is_active_tab)}))
+        except Exception:
+            pass
 
     def set_font_size(self, size: int) -> None:
         self.text.configure(font=("Consolas", size))
@@ -811,13 +841,17 @@ class TerminalTab:
                     with self.ws_lock:
                         self.ws = ws
                         self.connected_stream = True
+                    try:
+                        ws.send_text(json.dumps({"type": "active", "active": bool(self.is_active_tab)}))
+                    except Exception:
+                        pass
                     self.app.ui_queue.put(("status", f"WebSocket stream connected: {self.title}"))
                     while not self.stop_event.is_set():
                         raw = ws.recv_text()
                         msg = json.loads(raw)
                         typ = msg.get("type")
                         if typ == "snapshot":
-                            self.app.ui_queue.put(("snapshot", self.term_id, msg.get("data", "")))
+                            self.app.ui_queue.put(("snapshot", self.term_id, msg.get("data", ""), msg.get("cursor")))
                         elif typ == "output":
                             self.app.ui_queue.put(("output", self.term_id, msg.get("data", "")))
                         elif typ == "error":
@@ -857,14 +891,49 @@ class TerminalTab:
         except Exception:
             pass
 
-    def set_snapshot(self, data: str) -> None:
+    def set_snapshot(self, data: str, cursor: Optional[Dict[str, Any]] = None) -> None:
         # A snapshot is authoritative, so streaming echo suppression can end.
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("end", data)
+        self._apply_cursor_hint(cursor)
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
+
+    def _apply_cursor_hint(self, cursor: Optional[Dict[str, Any]]) -> None:
+        """Underline the tmux cursor character without inserting fake text.
+
+        tmux reports cursor coordinates inside the visible pane. The snapshot may
+        include scrollback above that pane, so the cursor row maps to the last
+        `height` lines of the captured text. If the cursor is at end-of-line, we
+        underline the previous character as a small hint rather than inserting a
+        fake cursor character that would pollute copy/paste.
+        """
+        self.text.tag_remove("cursor_hint", "1.0", "end")
+        if not cursor:
+            return
+        try:
+            x = max(0, int(cursor.get("x", 0)))
+            y = max(0, int(cursor.get("y", 0)))
+            height = max(1, int(cursor.get("height", 1)))
+            lines = self.text.get("1.0", "end-1c").split("\n")
+            if not lines:
+                return
+            visible_start = max(0, len(lines) - height)
+            row = min(len(lines) - 1, visible_start + y)
+            line = lines[row]
+            if not line:
+                return
+            # Cursor is a position between characters. Prefer underlining the
+            # character at that position; at EOL, underline the previous char.
+            col = min(x, max(0, len(line) - 1))
+            start = f"{row + 1}.{col}"
+            end = f"{row + 1}.{col + 1}"
+            self.text.tag_add("cursor_hint", start, end)
+        except Exception:
+            # Cursor hints must never break terminal rendering.
+            pass
 
     def append_output(self, data: str) -> None:
         if not data:
@@ -879,6 +948,7 @@ class TerminalTab:
         # glitch where pressing Enter first added an empty line and only the
         # next snapshot corrected it.
         self.text.configure(state="normal")
+        self.text.tag_remove("cursor_hint", "1.0", "end")
         i = 0
         while i < len(data):
             ch = data[i]
@@ -1090,7 +1160,7 @@ class TerminalTab:
                 # Fallback HTTP path also asks for an immediate snapshot so the
                 # display is corrected quickly even while WebSocket reconnects.
                 snap = self.app.api.request("GET", f"/terminals/{urllib.parse.quote(self.term_id)}/snapshot", timeout=5.0)
-                self.app.ui_queue.put(("snapshot", self.term_id, snap.get("data", "")))
+                self.app.ui_queue.put(("snapshot", self.term_id, snap.get("data", ""), snap.get("cursor")))
             except Exception:
                 self.app.ui_queue.put(("error", traceback.format_exc()))
 
@@ -1123,6 +1193,7 @@ class RemoteTerminalApp(tk.Tk):
         self.terminal_order: list[str] = []
         self.default_cwd: str = get_saved_default_cwd()
         self.font_size: int = get_saved_font_size()
+        self.window_active: bool = True
         self.ui_queue: "queue.Queue[Any]" = queue.Queue()
 
         self._build_ui()
@@ -1131,6 +1202,10 @@ class RemoteTerminalApp(tk.Tk):
         self.bind_all("<Control-minus>", lambda _e: self.decrease_font_size())
         self.bind_all("<Control-KP_Add>", lambda _e: self.increase_font_size())
         self.bind_all("<Control-KP_Subtract>", lambda _e: self.decrease_font_size())
+        self.bind("<FocusIn>", self.on_window_focus_in)
+        self.bind("<FocusOut>", self.on_window_focus_out)
+        self.bind("<Map>", lambda _e: self.update_tab_activity())
+        self.bind("<Unmap>", lambda _e: self.update_tab_activity())
         self.after(100, self.process_ui_queue)
         self.after(200, self.open_connection_dialog)
 
@@ -1171,10 +1246,44 @@ class RemoteTerminalApp(tk.Tk):
         main.add(left, weight=1)
 
         self.notebook = ttk.Notebook(main)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self.update_tab_activity())
         main.add(self.notebook, weight=4)
 
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(self, textvariable=self.status_var, anchor="w").pack(side="bottom", fill="x")
+
+    def on_window_focus_in(self, event: tk.Event | None = None) -> None:
+        self.window_active = True
+        self.update_tab_activity()
+
+    def on_window_focus_out(self, event: tk.Event | None = None) -> None:
+        # Focus can briefly move between child widgets inside the same window.
+        # Delay the check so we only mark inactive when focus really left the app.
+        self.after(200, self._confirm_window_focus_out)
+
+    def _confirm_window_focus_out(self) -> None:
+        try:
+            self.window_active = self.focus_displayof() is not None
+        except Exception:
+            self.window_active = False
+        self.update_tab_activity()
+
+    def update_tab_activity(self) -> None:
+        """Tell each attached websocket whether it is the visible active tab.
+
+        The server uses this to reduce capture-pane checks for hidden tabs while
+        keeping the currently viewed tab responsive for tqdm/progress redraws.
+        """
+        current = self.notebook.select() if hasattr(self, "notebook") else ""
+        active_window = bool(self.window_active)
+        try:
+            # Minimized/iconified windows should also be treated as inactive.
+            if self.state() == "iconic":
+                active_window = False
+        except Exception:
+            pass
+        for tab in list(self.tabs.values()):
+            tab.set_active(active_window and str(tab.frame) == current)
 
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
@@ -1375,9 +1484,11 @@ class RemoteTerminalApp(tk.Tk):
         term_id = info["id"]
         if term_id in self.tabs:
             self.notebook.select(self.tabs[term_id].frame)
+            self.update_tab_activity()
             return
         try:
             self.tabs[term_id] = TerminalTab(self, info)
+            self.update_tab_activity()
         except Exception as exc:
             self.show_error(str(exc))
 
@@ -1463,10 +1574,11 @@ class RemoteTerminalApp(tk.Tk):
                     self.set_status(f"Closed {len(closed_ids)} remote terminal(s).")
                     self.refresh_terminals()
                 elif kind == "snapshot":
-                    _kind, term_id, data = item
+                    _kind, term_id, data, *rest = item
+                    cursor = rest[0] if rest else None
                     tab = self.tabs.get(term_id)
                     if tab is not None:
-                        tab.set_snapshot(data)
+                        tab.set_snapshot(data, cursor)
                 elif kind == "output":
                     _kind, term_id, data = item
                     tab = self.tabs.get(term_id)
