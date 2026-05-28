@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v25 improves the static cursor hint and keeps adaptive dirty-screen push.
+No third-party Python dependencies on Windows source mode. v26 uses a Windows-side overlay cursor hint and keeps adaptive dirty-screen push.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -39,7 +39,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v25: visible static cursor hint + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
+APP_VERSION = "v26: local overlay cursor hint + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -731,13 +731,13 @@ class TerminalTab:
         self.v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.text.yview)
         self.h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.text.xview)
         self.text.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
-        # v25: a non-blinking, non-copying cursor hint.  Underline alone is
-        # often invisible when the shell cursor sits on a trailing space after
-        # the prompt, so also paint a small background block over the selected
-        # character.  This is still only a Text tag, not the discarded v12 fake
-        # cursor character, so copy/paste output remains clean.
-        self.text.tag_configure("cursor_hint", underline=True, background="#606060")
-        self.text.tag_raise("cursor_hint")
+        # v26: a non-blinking Windows-side cursor hint.  This is an overlay
+        # frame placed over the Text widget using bbox() coordinates, not a
+        # fake inserted character.  It therefore remains visible even when the
+        # cursor is at EOL/trailing spaces, and copy/paste output stays clean.
+        self.cursor_index = "end-1c"
+        self.cursor_overlay = tk.Frame(self.text, bg="#d8d8d8", height=2, width=9, bd=0, highlightthickness=0)
+        self.cursor_overlay.place_forget()
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
@@ -891,6 +891,7 @@ class TerminalTab:
         try:
             self.text.yview_moveto(1.0)
             self.text.xview_moveto(0.0)
+            self.after_idle(self._redraw_cursor_overlay)
         except Exception:
             pass
 
@@ -900,55 +901,141 @@ class TerminalTab:
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("end", data)
-        self._apply_cursor_hint(cursor)
+        # v26 deliberately prefers a Windows-side cursor estimate.  tmux cursor
+        # metadata can be hard to map when capture-pane includes scrollback or
+        # joined/wrapped lines, which made the v24/v25 tag-based cursor vanish.
+        self._set_local_cursor_to_end()
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
+        self._redraw_cursor_overlay()
 
-    def _apply_cursor_hint(self, cursor: Optional[Dict[str, Any]]) -> None:
-        """Show a visible tmux cursor hint without inserting fake text.
-
-        tmux reports cursor coordinates inside the visible pane.  The snapshot
-        may include scrollback above that pane, so the cursor row maps to the
-        last `height` lines of the captured text.
-
-        v24 only used underline.  At a normal shell prompt, however, the cursor
-        often sits on a trailing space after `$ ` or `# `, and underlining a
-        space is nearly invisible in Tk.  v25 applies the same tag with a small
-        background block.  Nothing is inserted into the Text widget, so copying
-        terminal output is not polluted by a cursor symbol.
-        """
-        self.text.tag_remove("cursor_hint", "1.0", "end")
-        if not cursor:
-            return
+    def _normalize_cursor_index(self, index: str) -> str:
+        """Return a safe Text index for the local overlay cursor."""
         try:
-            x = max(0, int(cursor.get("x", 0)))
-            y = max(0, int(cursor.get("y", 0)))
-            height = max(1, int(cursor.get("height", 1)))
-            lines = self.text.get("1.0", "end-1c").split("\n")
-            if not lines:
-                return
-            visible_start = max(0, len(lines) - height)
-            row = min(len(lines) - 1, visible_start + y)
-            line = lines[row]
-
-            # Cursor is a position between characters.  Prefer the character at
-            # the cursor.  If the cursor is at EOL, highlight the previous
-            # character.  If the line is empty, try tagging the newline position
-            # as a best-effort hint.
-            line_no = row + 1
-            if line:
-                col = min(x, max(0, len(line) - 1))
-                start = f"{line_no}.{col}"
-                end = f"{line_no}.{col + 1}"
-            else:
-                start = f"{line_no}.0"
-                end = f"{line_no}.0+1c"
-
-            self.text.tag_add("cursor_hint", start, end)
-            self.text.tag_raise("cursor_hint")
+            idx = self.text.index(index)
         except Exception:
-            # Cursor hints must never break terminal rendering.
+            return "1.0"
+        try:
+            # Keep the cursor inside the actual content area.  Tk's "end" is
+            # the position after the extra trailing newline maintained by Text.
+            end_idx = self.text.index("end-1c")
+            if self.text.compare(idx, ">", end_idx):
+                idx = end_idx
+            if self.text.compare(idx, "<", "1.0"):
+                idx = "1.0"
+        except Exception:
             pass
+        return idx
+
+    def _set_local_cursor(self, index: str) -> None:
+        self.cursor_index = self._normalize_cursor_index(index)
+        self.text.mark_set("remote_cursor", self.cursor_index)
+        self._redraw_cursor_overlay()
+
+    def _set_local_cursor_to_end(self) -> None:
+        """Place the local cursor at the end of the current terminal text.
+
+        This is a deliberate Windows-side estimate.  For normal shell usage the
+        visible cursor should be at the end of the current prompt/output line.
+        It is much more robust than trying to map tmux pane_cursor_y onto a
+        scrollback-heavy capture-pane snapshot.
+        """
+        try:
+            content_end = self.text.index("end-1c")
+            self._set_local_cursor(content_end)
+        except Exception:
+            self.cursor_index = "1.0"
+
+    def _cursor_line_start(self) -> str:
+        try:
+            return self.text.index(f"{self.cursor_index} linestart")
+        except Exception:
+            return "end-1c linestart"
+
+    def _cursor_line_end(self) -> str:
+        try:
+            return self.text.index(f"{self.cursor_index} lineend")
+        except Exception:
+            return "end-1c lineend"
+
+    def _move_local_cursor_key(self, key: str) -> None:
+        """Update the local overlay for common editing/navigation keys.
+
+        The real shell remains authoritative and a snapshot will still correct
+        the text.  This is only a visual hint so the user can see where input is
+        expected, especially while waiting for the next pushed snapshot.
+        """
+        try:
+            idx = self.cursor_index
+            if key in {"Left", "BSpace"}:
+                line_start = self._cursor_line_start()
+                if self.text.compare(idx, ">", line_start):
+                    idx = self.text.index(f"{idx} -1c")
+            elif key == "Right":
+                line_end = self._cursor_line_end()
+                if self.text.compare(idx, "<", line_end):
+                    idx = self.text.index(f"{idx} +1c")
+            elif key == "Home":
+                idx = self._cursor_line_start()
+            elif key == "End":
+                idx = self._cursor_line_end()
+            elif key in {"Enter", "Escape", "Tab", "Up", "Down", "PageUp", "PageDown", "Delete"}:
+                # Let the imminent snapshot decide these cases.
+                return
+            self._set_local_cursor(idx)
+        except Exception:
+            pass
+
+    def _redraw_cursor_overlay(self) -> None:
+        """Draw a small underline overlay at the local cursor index.
+
+        This does not insert any character into the Text widget, so selecting or
+        copying terminal output is unaffected.  When the cursor is at line end,
+        Tk often has no bbox for that exact index; in that case use the previous
+        character's bbox and place the underline after it.
+        """
+        try:
+            if not hasattr(self, "cursor_overlay"):
+                return
+            idx = self._normalize_cursor_index(getattr(self, "cursor_index", "end-1c"))
+            self.cursor_index = idx
+            bbox = self.text.bbox(idx)
+            if bbox is not None:
+                x, y, w, h = bbox
+                width = max(8, int(w) if w else 8)
+            else:
+                # Common case: the cursor is after the final character of a
+                # line.  Place the underline just after the previous character.
+                prev_idx = idx
+                try:
+                    if self.text.compare(idx, ">", f"{idx} linestart"):
+                        prev_idx = self.text.index(f"{idx} -1c")
+                except Exception:
+                    pass
+                prev_bbox = self.text.bbox(prev_idx)
+                if prev_bbox is None:
+                    self.cursor_overlay.place_forget()
+                    return
+                px, py, pw, ph = prev_bbox
+                try:
+                    if self.text.compare(idx, ">", prev_idx):
+                        x = px + max(1, pw)
+                    else:
+                        x = px
+                except Exception:
+                    x = px
+                y, h = py, ph
+                width = max(8, int(pw) if pw else 8)
+            # A two-pixel underline is visible but unobtrusive on the black
+            # terminal background.
+            self.cursor_overlay.configure(width=width, height=2)
+            self.cursor_overlay.place(x=x, y=y + max(1, h - 3), width=width, height=2)
+            self.cursor_overlay.lift()
+        except Exception:
+            try:
+                self.cursor_overlay.place_forget()
+            except Exception:
+                pass
 
     def append_output(self, data: str) -> None:
         if not data:
@@ -963,7 +1050,6 @@ class TerminalTab:
         # glitch where pressing Enter first added an empty line and only the
         # next snapshot corrected it.
         self.text.configure(state="normal")
-        self.text.tag_remove("cursor_hint", "1.0", "end")
         i = 0
         while i < len(data):
             ch = data[i]
@@ -997,8 +1083,10 @@ class TerminalTab:
                 self.text.delete("1.0", f"{line_count - self.MAX_TEXT_LINES}.0")
         except Exception:
             pass
+        self._set_local_cursor_to_end()
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
+        self._redraw_cursor_overlay()
 
     def send_command(self) -> str:
         cmd = self.cmd_var.get()
@@ -1008,6 +1096,7 @@ class TerminalTab:
         return "break"
 
     def send_key(self, key: str) -> None:
+        self._move_local_cursor_key(key)
         self._send_message({"type": "key", "key": key}, fallback_endpoint="key")
 
     def _send_key_break(self, key: str) -> str:
