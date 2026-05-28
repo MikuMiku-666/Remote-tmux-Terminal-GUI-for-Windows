@@ -293,63 +293,144 @@ def capture_visible_pane(term_id: str) -> str:
     if not tmux_session_exists(name):
         raise HTTPException(status_code=404, detail="Terminal does not exist")
     cp = run_cmd(["tmux", "capture-pane", "-p", "-t", name], timeout=3.0)
-    return cp.stdout.rstrip("\n")
+    # Keep trailing blank pane rows so pane_cursor_y remains aligned with the
+    # captured visible rows.  The command mirror trims individual row endings
+    # later when extracting text.
+    return cp.stdout
 
 
-def strip_prompt_from_cursor_line(line: str, cursor_x: int | None = None) -> Dict[str, Any]:
-    """Best-effort extraction of the editable command from the cursor row.
+def _display_width_prefix_to_index(text: str, cols: int) -> int:
+    """Best-effort conversion from terminal column to Python string index.
 
-    tmux does not expose bash/readline's internal buffer directly.  The best
-    external signal is the visible cursor row.  For common shells this row is
-    `<prompt><current command>`, so we strip the last prompt separator before
-    the cursor.  The result is intentionally heuristic but works for typical
-    prompts such as:
-
-        (base) [user@host /path]$ python train.py
-        user@host:/path$ python train.py
-        >>> print(1)
-
-    If no known prompt marker is found, confident=False and the Windows client
-    should avoid overwriting the bottom input box.
+    The project mostly targets ASCII shell prompts/commands.  Still, this keeps
+    the code safe if a line contains a few wide characters by falling back to a
+    conservative one-character-per-column approximation when wcwidth is not
+    available.
     """
-    if line is None:
-        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
-    raw = line.rstrip("\r\n")
-    prefix = raw
-    if cursor_x is not None and cursor_x >= 0:
-        # cursor_x is a terminal column, not a Python character index.  For the
-        # ASCII-heavy shell prompts this approximation is good enough; if it is
-        # off for wide CJK chars, falling back to the full line is safer than
-        # returning nothing.
-        try:
-            prefix = raw[: min(len(raw), int(cursor_x))]
-        except Exception:
-            prefix = raw
+    if cols is None or cols < 0:
+        return len(text)
+    try:
+        from wcwidth import wcwidth  # type: ignore
+        used = 0
+        for i, ch in enumerate(text):
+            w = wcwidth(ch)
+            if w < 0:
+                w = 1
+            if used + w > cols:
+                return i
+            used += w
+        return len(text)
+    except Exception:
+        return min(len(text), int(cols))
 
-    separators = [
+
+def _prompt_candidates() -> list[str]:
+    return [
         ">>> ", "... ",          # Python REPL
         "$ ", "# ", "% ", "> ",
         "❯ ", "➜ ", "λ ",
+        ")$ ", "]$ ",            # common long prompts that may wrap
     ]
+
+
+def _find_prompt_marker(line: str) -> tuple[int, str]:
+    """Return the last likely prompt marker in a physical terminal row."""
     best_pos = -1
     best_sep = ""
-    search_area = prefix if prefix else raw
-    for sep in separators:
-        pos = search_area.rfind(sep)
+    for sep in _prompt_candidates():
+        pos = line.rfind(sep)
         if pos > best_pos:
             best_pos = pos
             best_sep = sep
+    return best_pos, best_sep
 
-    if best_pos >= 0:
-        prompt_end = best_pos + len(best_sep)
+
+def extract_command_from_visible_rows(rows: list[str], cursor_x: int, cursor_y: int) -> Dict[str, Any]:
+    """Best-effort extraction of the editable shell/readline command.
+
+    v28 only inspected the physical row containing tmux's cursor.  That fails
+    when the prompt is long or the recalled command wraps: the cursor row may be
+    a continuation row with no `$ ` marker.  This version searches upward from
+    the cursor row for the nearest prompt marker, then joins continuation rows
+    up to the cursor row.  This makes history recall with long prompts much more
+    reliable.
+    """
+    if not rows:
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None, "reason": "empty_rows"}
+
+    y = max(0, min(int(cursor_y or 0), len(rows) - 1))
+    x = max(0, int(cursor_x or 0))
+
+    # Prefer the row containing the cursor, but if it is a continuation line,
+    # scan upward to find the prompt row.  Limit the scan so old unrelated
+    # prompts in the visible pane are not accidentally used.
+    prompt_row = None
+    prompt_pos = -1
+    prompt_sep = ""
+    for r in range(y, max(-1, y - 8), -1):
+        pos, sep = _find_prompt_marker(rows[r].rstrip("\r\n"))
+        if pos >= 0:
+            prompt_row = r
+            prompt_pos = pos
+            prompt_sep = sep
+            break
+
+    if prompt_row is None:
+        # Fallback for very plain shells/prompts or custom PS1.  If the cursor
+        # row itself contains text and is near the bottom, mirror the current
+        # row instead of returning nothing.  Mark it as low-confidence so the
+        # client can choose to display it without being too aggressive.
+        raw = rows[y].rstrip("\r\n")
         return {
             "line": raw,
-            "cmdline": raw[prompt_end:],
-            "confident": True,
-            "prompt_end": prompt_end,
+            "cmdline": raw,
+            "confident": False,
+            "soft_confident": bool(raw.strip()),
+            "prompt_end": None,
+            "cursor_x": x,
+            "cursor_y": y,
+            "reason": "no_prompt_marker",
         }
 
-    return {"line": raw, "cmdline": "", "confident": False, "prompt_end": None}
+    first = rows[prompt_row].rstrip("\r\n")
+    prompt_end = prompt_pos + len(prompt_sep)
+    command_parts = [first[prompt_end:]]
+    if prompt_row < y:
+        # Physical line wrapping: command continues on subsequent terminal rows.
+        # Join without newlines because readline wraps one logical line.
+        for r in range(prompt_row + 1, y + 1):
+            command_parts.append(rows[r].rstrip("\r\n"))
+    cmd = "".join(command_parts)
+
+    # If the cursor is on the prompt row and inside the prompt, this is probably
+    # not an editable command yet.  Return empty but keep confident=True so the
+    # bottom mirror clears stale text at a fresh prompt.
+    if prompt_row == y and x < prompt_end:
+        cmd = ""
+
+    return {
+        "line": rows[y].rstrip("\r\n"),
+        "prompt_row_line": first,
+        "cmdline": cmd,
+        "confident": True,
+        "soft_confident": True,
+        "prompt_end": prompt_end,
+        "prompt_row": prompt_row,
+        "cursor_x": x,
+        "cursor_y": y,
+        "reason": "prompt_marker_found",
+    }
+
+
+def strip_prompt_from_cursor_line(line: str, cursor_x: int | None = None) -> Dict[str, Any]:
+    """Compatibility wrapper used by older callers/tests.
+
+    New code should prefer extract_command_from_visible_rows(), because it can
+    handle wrapped long prompts and continuation rows.
+    """
+    if line is None:
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
+    return extract_command_from_visible_rows([line.rstrip("\r\n")], int(cursor_x or 0), 0)
 
 
 def get_current_command_info(term_id: str, cursor: Dict[str, int] | None = None) -> Dict[str, Any]:
@@ -357,22 +438,24 @@ def get_current_command_info(term_id: str, cursor: Dict[str, int] | None = None)
     if cursor is None:
         cursor = get_cursor_info(term_id)
     if not cursor:
-        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None, "reason": "no_cursor"}
     try:
         visible = capture_visible_pane(term_id)
-        rows = visible.split("\n")
+        # Keep trailing blank rows while normalizing CRLF.  rstrip() made y-to-row
+        # alignment fragile when the cursor sat near the bottom of a pane with
+        # blank lines below it.
+        rows = visible.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         y = int(cursor.get("y", 0))
         x = int(cursor.get("x", 0))
         if y < 0:
             y = 0
         if y >= len(rows):
             y = len(rows) - 1 if rows else 0
-        line = rows[y] if rows else ""
-        info = strip_prompt_from_cursor_line(line, x)
-        info.update({"cursor_x": x, "cursor_y": y})
+        info = extract_command_from_visible_rows(rows, x, y)
+        info.update({"cursor_x": x, "cursor_y": y, "pane_height": cursor.get("height"), "pane_width": cursor.get("width")})
         return info
-    except Exception:
-        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
+    except Exception as exc:
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None, "reason": f"exception:{exc}"}
 
 
 def capture_screen_state(term_id: str, scrollback: int = 5000) -> Dict[str, Any]:
@@ -527,7 +610,7 @@ def normalize_stream_text(text: str) -> str:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     ensure_tmux()
-    return {"ok": True, "app": APP_NAME, "version": "v28-remote-cmdline-sync", "tmux": True, "time": time.time()}
+    return {"ok": True, "app": APP_NAME, "version": "v29-cmdline-sync-fix", "tmux": True, "time": time.time()}
 
 
 @app.get("/terminals")

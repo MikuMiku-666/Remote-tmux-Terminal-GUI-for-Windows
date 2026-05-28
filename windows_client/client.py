@@ -39,7 +39,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v28: Linux-side current command sync + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
+APP_VERSION = "v29: reliable command mirror + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -775,8 +775,14 @@ class TerminalTab:
         bottom = ttk.Frame(self.frame)
         bottom.pack(side="bottom", fill="x")
         self.cmd_var = tk.StringVar()
+        # v29: the bottom box is both a local send box and a remote-command
+        # mirror.  Do not blindly skip syncing when it has focus; instead only
+        # protect text that the user has actually edited locally.
+        self.entry_dirty_local = False
+        self._syncing_entry_from_remote = False
         self.entry = ttk.Entry(bottom, textvariable=self.cmd_var)
         self.entry.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        self.entry.bind("<KeyPress>", self.on_entry_keypress)
         self.entry.bind("<Return>", lambda _e: self.send_command())
         self.entry.bind("<Control-c>", lambda _e: self._send_key_break("C-c"))
         self.entry.bind("<Control-d>", lambda _e: self._send_key_break("C-d"))
@@ -1000,35 +1006,58 @@ class TerminalTab:
         except Exception:
             pass
 
+    def on_entry_keypress(self, event: tk.Event) -> None:
+        """Remember whether the user is composing a local command in the box."""
+        # Return is handled by send_command() and should not mark a new dirty
+        # local edit after it sends/clears the box.
+        if getattr(event, "keysym", "") in {"Return", "KP_Enter"}:
+            return
+        if self._syncing_entry_from_remote:
+            return
+        # Navigation keys alone do not create a local command, but editing keys
+        # or printable characters should protect the box from remote mirroring.
+        editing_keys = {
+            "BackSpace", "Delete", "space", "Tab",
+        }
+        if getattr(event, "char", "") or getattr(event, "keysym", "") in editing_keys:
+            self.entry_dirty_local = True
+
     def _sync_bottom_input_from_remote(self, cmdline: Optional[Dict[str, Any]]) -> None:
         """Mirror the current remote candidate command into the bottom Entry.
 
-        This is intentionally conservative: do not overwrite text while the
-        bottom input itself has focus, because that means the user is composing
-        a local command that has not been sent to Linux yet.  When the black
-        terminal area has focus, Linux already sees every key immediately, so
-        it is safe and useful for the Entry to mirror the remote readline state.
+        v28 was too conservative and skipped all updates while the Entry had
+        focus; in practice the Entry often keeps focus even when the black
+        terminal is being used, so the mirror appeared to do nothing.  v29 only
+        skips if the user has actually typed unsent local text in the Entry.
         """
         if not isinstance(cmdline, dict):
             return
-        if not cmdline.get("confident", False):
+        # Prefer confident prompt parsing, but allow soft confidence for custom
+        # prompts so users can still see something useful instead of an inert
+        # bottom box.
+        if not (cmdline.get("confident", False) or cmdline.get("soft_confident", False)):
             return
-        try:
-            focused = self.app.focus_get()
-            if focused is self.entry:
-                return
-        except Exception:
-            pass
         value = str(cmdline.get("cmdline", ""))
-        # Avoid showing massive pasted or accidental full-screen lines in the
-        # single-line command box.
         if "\n" in value or len(value) > 4096:
             return
         try:
-            if self.cmd_var.get() != value:
-                self.cmd_var.set(value)
+            focused = self.app.focus_get()
+            if focused is self.entry and self.entry_dirty_local and self.cmd_var.get() != value:
+                # User is composing locally; do not destroy unsent text.
+                return
         except Exception:
             pass
+        try:
+            if self.cmd_var.get() != value:
+                self._syncing_entry_from_remote = True
+                self.cmd_var.set(value)
+                self._syncing_entry_from_remote = False
+            # Once we have accepted the remote mirror, the box no longer holds a
+            # protected local draft.
+            self.entry_dirty_local = False
+        except Exception:
+            self._syncing_entry_from_remote = False
+
 
     def append_output(self, data: str) -> None:
         if not data:
@@ -1084,11 +1113,15 @@ class TerminalTab:
     def send_command(self) -> str:
         cmd = self.cmd_var.get()
         data = "\n" if not cmd else cmd + "\n"
+        self._syncing_entry_from_remote = True
         self.cmd_var.set("")
+        self._syncing_entry_from_remote = False
+        self.entry_dirty_local = False
         self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
         return "break"
 
     def send_key(self, key: str) -> None:
+        self.entry_dirty_local = False
         self._move_local_cursor_key(key)
         self._send_message({"type": "key", "key": key}, fallback_endpoint="key")
 
@@ -1170,6 +1203,7 @@ class TerminalTab:
             return "break"
         data = data.replace("\r\n", "\n").replace("\r", "\n")
         if data:
+            self.entry_dirty_local = False
             self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
             self.app.set_status(f"Pasted {len(data)} character(s) to remote terminal.")
         return "break"
@@ -1224,6 +1258,7 @@ class TerminalTab:
             return "break"
         ch = event.char
         if ch and ch >= " " and ch != "\x7f":
+            self.entry_dirty_local = False
             self._send_message({"type": "input", "data": ch}, fallback_endpoint="input")
             return "break"
         return "break"
