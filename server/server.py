@@ -281,9 +281,108 @@ def get_cursor_info(term_id: str) -> Dict[str, int] | None:
         return None
 
 
+def capture_visible_pane(term_id: str) -> str:
+    """Capture only the currently visible tmux pane rows.
+
+    This is used for Linux-side cursor/readline alignment.  The normal
+    scrollback snapshot can contain thousands of history lines, while tmux
+    pane_cursor_y is relative to the visible pane.  Keeping a separate visible
+    capture avoids the old scrollback-to-cursor mapping mismatch.
+    """
+    name = session_name(term_id)
+    if not tmux_session_exists(name):
+        raise HTTPException(status_code=404, detail="Terminal does not exist")
+    cp = run_cmd(["tmux", "capture-pane", "-p", "-t", name], timeout=3.0)
+    return cp.stdout.rstrip("\n")
+
+
+def strip_prompt_from_cursor_line(line: str, cursor_x: int | None = None) -> Dict[str, Any]:
+    """Best-effort extraction of the editable command from the cursor row.
+
+    tmux does not expose bash/readline's internal buffer directly.  The best
+    external signal is the visible cursor row.  For common shells this row is
+    `<prompt><current command>`, so we strip the last prompt separator before
+    the cursor.  The result is intentionally heuristic but works for typical
+    prompts such as:
+
+        (base) [user@host /path]$ python train.py
+        user@host:/path$ python train.py
+        >>> print(1)
+
+    If no known prompt marker is found, confident=False and the Windows client
+    should avoid overwriting the bottom input box.
+    """
+    if line is None:
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
+    raw = line.rstrip("\r\n")
+    prefix = raw
+    if cursor_x is not None and cursor_x >= 0:
+        # cursor_x is a terminal column, not a Python character index.  For the
+        # ASCII-heavy shell prompts this approximation is good enough; if it is
+        # off for wide CJK chars, falling back to the full line is safer than
+        # returning nothing.
+        try:
+            prefix = raw[: min(len(raw), int(cursor_x))]
+        except Exception:
+            prefix = raw
+
+    separators = [
+        ">>> ", "... ",          # Python REPL
+        "$ ", "# ", "% ", "> ",
+        "❯ ", "➜ ", "λ ",
+    ]
+    best_pos = -1
+    best_sep = ""
+    search_area = prefix if prefix else raw
+    for sep in separators:
+        pos = search_area.rfind(sep)
+        if pos > best_pos:
+            best_pos = pos
+            best_sep = sep
+
+    if best_pos >= 0:
+        prompt_end = best_pos + len(best_sep)
+        return {
+            "line": raw,
+            "cmdline": raw[prompt_end:],
+            "confident": True,
+            "prompt_end": prompt_end,
+        }
+
+    return {"line": raw, "cmdline": "", "confident": False, "prompt_end": None}
+
+
+def get_current_command_info(term_id: str, cursor: Dict[str, int] | None = None) -> Dict[str, Any]:
+    """Return the visible cursor row and best-effort editable command text."""
+    if cursor is None:
+        cursor = get_cursor_info(term_id)
+    if not cursor:
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
+    try:
+        visible = capture_visible_pane(term_id)
+        rows = visible.split("\n")
+        y = int(cursor.get("y", 0))
+        x = int(cursor.get("x", 0))
+        if y < 0:
+            y = 0
+        if y >= len(rows):
+            y = len(rows) - 1 if rows else 0
+        line = rows[y] if rows else ""
+        info = strip_prompt_from_cursor_line(line, x)
+        info.update({"cursor_x": x, "cursor_y": y})
+        return info
+    except Exception:
+        return {"line": "", "cmdline": "", "confident": False, "prompt_end": None}
+
+
 def capture_screen_state(term_id: str, scrollback: int = 5000) -> Dict[str, Any]:
-    """Capture the authoritative pane text plus cursor metadata."""
-    return {"data": capture_pane(term_id, scrollback=scrollback), "cursor": get_cursor_info(term_id)}
+    """Capture the authoritative pane text plus Linux-side cursor/command metadata."""
+    cursor = get_cursor_info(term_id)
+    return {
+        "data": capture_pane(term_id, scrollback=scrollback),
+        "cursor": cursor,
+        "cmdline": get_current_command_info(term_id, cursor),
+    }
 
 
 def send_text(term_id: str, data: str) -> None:
@@ -428,7 +527,7 @@ def normalize_stream_text(text: str) -> str:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     ensure_tmux()
-    return {"ok": True, "app": APP_NAME, "version": "v26-local-cursor", "tmux": True, "time": time.time()}
+    return {"ok": True, "app": APP_NAME, "version": "v28-remote-cmdline-sync", "tmux": True, "time": time.time()}
 
 
 @app.get("/terminals")
@@ -689,9 +788,10 @@ async def websocket_terminal(ws: WebSocket, term_id: str) -> None:
                 dirty_event.clear()
 
                 state = await asyncio.to_thread(capture_screen_state, term_id)
-                # Compare both data and cursor. This lets simple cursor movement
-                # after input update the underline hint even if the text is same.
-                comparable = {"data": state.get("data", ""), "cursor": state.get("cursor")}
+                # Compare text, cursor, and current command metadata. This lets
+                # history recall/editing update the bottom command mirror even
+                # if the rendered pane text is otherwise similar.
+                comparable = {"data": state.get("data", ""), "cursor": state.get("cursor"), "cmdline": state.get("cmdline")}
                 if comparable != last_state:
                     last_state = comparable
                     last_change_time = time.monotonic()

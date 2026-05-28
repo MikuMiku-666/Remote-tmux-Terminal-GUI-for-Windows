@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v26 uses a Windows-side overlay cursor hint and keeps adaptive dirty-screen push.
+No third-party Python dependencies on Windows source mode. v28 syncs the bottom input box from the Linux-side current command line and keeps adaptive dirty-screen push.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -39,7 +39,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v26: local overlay cursor hint + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
+APP_VERSION = "v28: Linux-side current command sync + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -731,13 +731,13 @@ class TerminalTab:
         self.v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.text.yview)
         self.h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.text.xview)
         self.text.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
-        # v26: a non-blinking Windows-side cursor hint.  This is an overlay
-        # frame placed over the Text widget using bbox() coordinates, not a
-        # fake inserted character.  It therefore remains visible even when the
-        # cursor is at EOL/trailing spaces, and copy/paste output stays clean.
+        # v27: a non-blinking Windows-side cursor hint implemented as a Text
+        # tag on one real character cell.  v26 used a placed overlay frame, but
+        # Tk can report a huge bbox for newline / line-end positions, which may
+        # look like a long white line across the bottom of the terminal.  A tag
+        # never inserts characters and never changes copied terminal content.
         self.cursor_index = "end-1c"
-        self.cursor_overlay = tk.Frame(self.text, bg="#d8d8d8", height=2, width=9, bd=0, highlightthickness=0)
-        self.cursor_overlay.place_forget()
+        self.text.tag_configure("local_cursor", background="#5a5a5a", underline=True)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
@@ -794,7 +794,7 @@ class TerminalTab:
 
         hint = ttk.Label(
             self.frame,
-            text=APP_VERSION + " Click black area for interactive keys. Ctrl-C copies selected text; otherwise interrupts. Ctrl+V pastes; Ctrl+Alt+V sends raw Ctrl-V.",
+            text=APP_VERSION + " Click black area for interactive keys. Bottom input mirrors current remote command after history/editing. Ctrl-C copies selected text; otherwise interrupts. Ctrl+V pastes; Ctrl+Alt+V sends raw Ctrl-V.",
             anchor="w",
         )
         hint.pack(side="bottom", fill="x")
@@ -854,7 +854,7 @@ class TerminalTab:
                         msg = json.loads(raw)
                         typ = msg.get("type")
                         if typ == "snapshot":
-                            self.app.ui_queue.put(("snapshot", self.term_id, msg.get("data", ""), msg.get("cursor")))
+                            self.app.ui_queue.put(("snapshot", self.term_id, msg.get("data", ""), msg.get("cursor"), msg.get("cmdline")))
                         elif typ == "output":
                             self.app.ui_queue.put(("output", self.term_id, msg.get("data", "")))
                         elif typ == "error":
@@ -891,23 +891,25 @@ class TerminalTab:
         try:
             self.text.yview_moveto(1.0)
             self.text.xview_moveto(0.0)
-            self.after_idle(self._redraw_cursor_overlay)
+            self.after_idle(self._redraw_cursor_hint)
         except Exception:
             pass
 
-    def set_snapshot(self, data: str, cursor: Optional[Dict[str, Any]] = None) -> None:
+    def set_snapshot(self, data: str, cursor: Optional[Dict[str, Any]] = None, cmdline: Optional[Dict[str, Any]] = None) -> None:
         # A snapshot is authoritative, so streaming echo suppression can end.
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("end", data)
-        # v26 deliberately prefers a Windows-side cursor estimate.  tmux cursor
-        # metadata can be hard to map when capture-pane includes scrollback or
-        # joined/wrapped lines, which made the v24/v25 tag-based cursor vanish.
-        self._set_local_cursor_to_end()
+        # v28: local cursor rendering was unreliable in Tk Text.  The practical
+        # replacement is Linux-side current-command synchronization: when the
+        # user types in the black area or recalls history with Up/Down, the
+        # bottom input box mirrors the command currently shown by the remote
+        # shell/readline line.
+        self.text.tag_remove("local_cursor", "1.0", "end")
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
-        self._redraw_cursor_overlay()
+        self._sync_bottom_input_from_remote(cmdline)
 
     def _normalize_cursor_index(self, index: str) -> str:
         """Return a safe Text index for the local overlay cursor."""
@@ -930,7 +932,7 @@ class TerminalTab:
     def _set_local_cursor(self, index: str) -> None:
         self.cursor_index = self._normalize_cursor_index(index)
         self.text.mark_set("remote_cursor", self.cursor_index)
-        self._redraw_cursor_overlay()
+        self._redraw_cursor_hint()
 
     def _set_local_cursor_to_end(self) -> None:
         """Place the local cursor at the end of the current terminal text.
@@ -986,56 +988,47 @@ class TerminalTab:
         except Exception:
             pass
 
-    def _redraw_cursor_overlay(self) -> None:
-        """Draw a small underline overlay at the local cursor index.
+    def _redraw_cursor_hint(self) -> None:
+        """v28 disables the unreliable local visual cursor.
 
-        This does not insert any character into the Text widget, so selecting or
-        copying terminal output is unaffected.  When the cursor is at line end,
-        Tk often has no bbox for that exact index; in that case use the previous
-        character's bbox and place the underline after it.
+        Earlier local/Tk-based cursor attempts either drifted away from the
+        remote readline buffer or rendered as a long line.  We keep this method
+        as a no-op cleanup so older calls are harmless.
         """
         try:
-            if not hasattr(self, "cursor_overlay"):
-                return
-            idx = self._normalize_cursor_index(getattr(self, "cursor_index", "end-1c"))
-            self.cursor_index = idx
-            bbox = self.text.bbox(idx)
-            if bbox is not None:
-                x, y, w, h = bbox
-                width = max(8, int(w) if w else 8)
-            else:
-                # Common case: the cursor is after the final character of a
-                # line.  Place the underline just after the previous character.
-                prev_idx = idx
-                try:
-                    if self.text.compare(idx, ">", f"{idx} linestart"):
-                        prev_idx = self.text.index(f"{idx} -1c")
-                except Exception:
-                    pass
-                prev_bbox = self.text.bbox(prev_idx)
-                if prev_bbox is None:
-                    self.cursor_overlay.place_forget()
-                    return
-                px, py, pw, ph = prev_bbox
-                try:
-                    if self.text.compare(idx, ">", prev_idx):
-                        x = px + max(1, pw)
-                    else:
-                        x = px
-                except Exception:
-                    x = px
-                y, h = py, ph
-                width = max(8, int(pw) if pw else 8)
-            # A two-pixel underline is visible but unobtrusive on the black
-            # terminal background.
-            self.cursor_overlay.configure(width=width, height=2)
-            self.cursor_overlay.place(x=x, y=y + max(1, h - 3), width=width, height=2)
-            self.cursor_overlay.lift()
+            self.text.tag_remove("local_cursor", "1.0", "end")
         except Exception:
-            try:
-                self.cursor_overlay.place_forget()
-            except Exception:
-                pass
+            pass
+
+    def _sync_bottom_input_from_remote(self, cmdline: Optional[Dict[str, Any]]) -> None:
+        """Mirror the current remote candidate command into the bottom Entry.
+
+        This is intentionally conservative: do not overwrite text while the
+        bottom input itself has focus, because that means the user is composing
+        a local command that has not been sent to Linux yet.  When the black
+        terminal area has focus, Linux already sees every key immediately, so
+        it is safe and useful for the Entry to mirror the remote readline state.
+        """
+        if not isinstance(cmdline, dict):
+            return
+        if not cmdline.get("confident", False):
+            return
+        try:
+            focused = self.app.focus_get()
+            if focused is self.entry:
+                return
+        except Exception:
+            pass
+        value = str(cmdline.get("cmdline", ""))
+        # Avoid showing massive pasted or accidental full-screen lines in the
+        # single-line command box.
+        if "\n" in value or len(value) > 4096:
+            return
+        try:
+            if self.cmd_var.get() != value:
+                self.cmd_var.set(value)
+        except Exception:
+            pass
 
     def append_output(self, data: str) -> None:
         if not data:
@@ -1086,7 +1079,7 @@ class TerminalTab:
         self._set_local_cursor_to_end()
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
-        self._redraw_cursor_overlay()
+        self._redraw_cursor_hint()
 
     def send_command(self) -> str:
         cmd = self.cmd_var.get()
@@ -1264,7 +1257,7 @@ class TerminalTab:
                 # Fallback HTTP path also asks for an immediate snapshot so the
                 # display is corrected quickly even while WebSocket reconnects.
                 snap = self.app.api.request("GET", f"/terminals/{urllib.parse.quote(self.term_id)}/snapshot", timeout=5.0)
-                self.app.ui_queue.put(("snapshot", self.term_id, snap.get("data", ""), snap.get("cursor")))
+                self.app.ui_queue.put(("snapshot", self.term_id, snap.get("data", ""), snap.get("cursor"), snap.get("cmdline")))
             except Exception:
                 self.app.ui_queue.put(("error", traceback.format_exc()))
 
@@ -1679,10 +1672,11 @@ class RemoteTerminalApp(tk.Tk):
                     self.refresh_terminals()
                 elif kind == "snapshot":
                     _kind, term_id, data, *rest = item
-                    cursor = rest[0] if rest else None
+                    cursor = rest[0] if len(rest) >= 1 else None
+                    cmdline = rest[1] if len(rest) >= 2 else None
                     tab = self.tabs.get(term_id)
                     if tab is not None:
-                        tab.set_snapshot(data, cursor)
+                        tab.set_snapshot(data, cursor, cmdline)
                 elif kind == "output":
                     _kind, term_id, data = item
                     tab = self.tabs.get(term_id)
