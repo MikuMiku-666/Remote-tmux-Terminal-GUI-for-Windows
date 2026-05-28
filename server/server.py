@@ -428,7 +428,7 @@ def normalize_stream_text(text: str) -> str:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     ensure_tmux()
-    return {"ok": True, "app": APP_NAME, "version": "v24-adaptive-cursor", "tmux": True, "time": time.time()}
+    return {"ok": True, "app": APP_NAME, "version": "v25-visible-cursor", "tmux": True, "time": time.time()}
 
 
 @app.get("/terminals")

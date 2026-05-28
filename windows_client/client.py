@@ -2,7 +2,7 @@
 """
 Windows GUI client for the remote tmux terminal server.
 
-No third-party Python dependencies on Windows source mode. v24 adds adaptive dirty-screen push and a static underline cursor hint.
+No third-party Python dependencies on Windows source mode. v25 improves the static cursor hint and keeps adaptive dirty-screen push.
 - Uses Windows built-in ssh.exe for SSH local port forwarding.
 - Uses a small stdlib-only WebSocket client for terminal streaming.
 - Keeps urllib only for create/list/delete/login health calls.
@@ -39,7 +39,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "RemoteTmuxTerminal"
 CONFIG_FILE = CONFIG_DIR / "client_config.json"
-APP_VERSION = "v24: adaptive dirty-screen push + static underline cursor hint; includes v22 SSH_ASKPASS; no v12 cursor."
+APP_VERSION = "v25: visible static cursor hint + adaptive dirty-screen push; includes v22 SSH_ASKPASS; no v12 cursor."
 ERROR_LOG_FILE = CONFIG_DIR / "client_error.log"
 
 
@@ -731,10 +731,13 @@ class TerminalTab:
         self.v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.text.yview)
         self.h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.text.xview)
         self.text.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
-        # v24: a non-blinking, non-copying cursor hint. It underlines the
-        # character at tmux's pane_cursor_x/y when snapshots include cursor
-        # metadata. This is intentionally not the discarded v12 fake cursor.
-        self.text.tag_configure("cursor_hint", underline=True)
+        # v25: a non-blinking, non-copying cursor hint.  Underline alone is
+        # often invisible when the shell cursor sits on a trailing space after
+        # the prompt, so also paint a small background block over the selected
+        # character.  This is still only a Text tag, not the discarded v12 fake
+        # cursor character, so copy/paste output remains clean.
+        self.text.tag_configure("cursor_hint", underline=True, background="#606060")
+        self.text.tag_raise("cursor_hint")
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
@@ -902,13 +905,17 @@ class TerminalTab:
         self._scroll_bottom_keep_left()
 
     def _apply_cursor_hint(self, cursor: Optional[Dict[str, Any]]) -> None:
-        """Underline the tmux cursor character without inserting fake text.
+        """Show a visible tmux cursor hint without inserting fake text.
 
-        tmux reports cursor coordinates inside the visible pane. The snapshot may
-        include scrollback above that pane, so the cursor row maps to the last
-        `height` lines of the captured text. If the cursor is at end-of-line, we
-        underline the previous character as a small hint rather than inserting a
-        fake cursor character that would pollute copy/paste.
+        tmux reports cursor coordinates inside the visible pane.  The snapshot
+        may include scrollback above that pane, so the cursor row maps to the
+        last `height` lines of the captured text.
+
+        v24 only used underline.  At a normal shell prompt, however, the cursor
+        often sits on a trailing space after `$ ` or `# `, and underlining a
+        space is nearly invisible in Tk.  v25 applies the same tag with a small
+        background block.  Nothing is inserted into the Text widget, so copying
+        terminal output is not polluted by a cursor symbol.
         """
         self.text.tag_remove("cursor_hint", "1.0", "end")
         if not cursor:
@@ -923,14 +930,22 @@ class TerminalTab:
             visible_start = max(0, len(lines) - height)
             row = min(len(lines) - 1, visible_start + y)
             line = lines[row]
-            if not line:
-                return
-            # Cursor is a position between characters. Prefer underlining the
-            # character at that position; at EOL, underline the previous char.
-            col = min(x, max(0, len(line) - 1))
-            start = f"{row + 1}.{col}"
-            end = f"{row + 1}.{col + 1}"
+
+            # Cursor is a position between characters.  Prefer the character at
+            # the cursor.  If the cursor is at EOL, highlight the previous
+            # character.  If the line is empty, try tagging the newline position
+            # as a best-effort hint.
+            line_no = row + 1
+            if line:
+                col = min(x, max(0, len(line) - 1))
+                start = f"{line_no}.{col}"
+                end = f"{line_no}.{col + 1}"
+            else:
+                start = f"{line_no}.0"
+                end = f"{line_no}.0+1c"
+
             self.text.tag_add("cursor_hint", start, end)
+            self.text.tag_raise("cursor_hint")
         except Exception:
             # Cursor hints must never break terminal rendering.
             pass
