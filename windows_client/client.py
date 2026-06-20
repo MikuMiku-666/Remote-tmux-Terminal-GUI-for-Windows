@@ -915,21 +915,15 @@ class TerminalTab:
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        # v30: strip tmux grid-padding using pane_width.  Each line from
-        # capture-pane is padded to pane_width with trailing spaces (unless
-        # it wraps).  We rstrip those, then add one cursor cell per non-empty
-        # line.  After this, every space in the widget is a cursor cell and
-        # there is zero padding confusion.
-        pw = (cursor or {}).get("width", 0)
-        if pw > 0:
-            lines = []
-            for line in data.split("\n"):
-                line = line.rstrip()
-                if line:
-                    line += " "
-                lines.append(line)
-            data = "\n".join(lines)
-        self.text.insert("end", data)
+        # v30: always strip trailing spaces and add one cursor cell per
+        # non-empty line.  This removes tmux grid-padding unconditionally.
+        lines = []
+        for line in data.split("\n"):
+            line = line.rstrip()
+            if line:
+                line += " "
+            lines.append(line)
+        self.text.insert("end", "\n".join(lines))
         # v30: lightweight local cursor — placed at end of visible text.
         # If the user moved the cursor manually (arrow keys, typing, Backspace,
         # Delete), honour that position across ALL snapshots until a major
@@ -970,16 +964,18 @@ class TerminalTab:
         self._redraw_cursor_hint()
 
     def _set_local_cursor_to_end(self) -> None:
-        """Place cursor at end of last non-blank line; release manual lock."""
+        """Place cursor at end of last non-blank line.
+
+        Does NOT touch ``_cursor_manually_placed`` — callers are
+        responsible for releasing the manual-cursor lock when appropriate.
+        """
         try:
             total = int(self.text.index("end-1c").split(".")[0])
             for line_n in range(total, max(1, total - 40), -1):
                 raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
                 if raw.strip():
-                    self._cursor_manually_placed = False
                     self._set_local_cursor(self._visible_end(line_n))
                     return
-            self._cursor_manually_placed = False
             self._set_local_cursor("end-1c")
         except Exception:
             self.cursor_index = "1.0"
