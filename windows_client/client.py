@@ -915,18 +915,18 @@ class TerminalTab:
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        # v30: strip tmux grid-padding spaces from every line, but preserve
-        # the single space that follows a shell prompt marker ($ or #).
-        # That space is part of PS1/PS2, not tmux padding, and losing it
-        # causes the initial cursor to land on the marker itself.
-        stripped = []
+        # v30: strip tmux grid padding then add one cursor cell.  We can't
+        # distinguish user-typed trailing spaces from tmux padding, so we
+        # rstrip all trailing spaces and append a single space to every
+        # non-empty line.  This gives the cursor exactly one visible cell
+        # at end-of-line without the 50-character padding ghost.
+        lines = []
         for line in data.split("\n"):
             line = line.rstrip()
-            if line.endswith("$") or line.endswith("#"):
+            if line:
                 line += " "
-            stripped.append(line)
-        cleaned = "\n".join(stripped)
-        self.text.insert("end", cleaned)
+            lines.append(line)
+        self.text.insert("end", "\n".join(lines))
         # v30: lightweight local cursor — placed at end of visible text.
         # If the user moved the cursor manually (arrow keys, typing, Backspace,
         # Delete), honour that position across ALL snapshots until a major
@@ -1049,11 +1049,10 @@ class TerminalTab:
             return f"{line_n}.0"
 
     def _visible_end(self, line_n: int) -> str:
-        """Return the index of the last real character on *line_n*.
+        """Return the end-of-line cursor position on *line_n*.
 
-        This is the character just before line.end (the newline).  Using
-        ``line.end`` directly would cause ``+1c`` to wrap to the next line
-        and break cursor tracking on trailing spaces.
+        Each non-empty line has exactly one trailing space (the cursor cell
+        added during snapshot insertion).  For empty lines we return column 0.
         """
         try:
             return self.text.index(f"{line_n}.end - 1c")
