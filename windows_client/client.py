@@ -915,11 +915,17 @@ class TerminalTab:
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        # v30: strip tmux grid-padding spaces from every line.  Tmux
-        # capture-pane pads each row to the full pane width with trailing
-        # spaces.  These are invisible filler and interfere with cursor
-        # positioning (we can't tell user-typed spaces from padding).
-        cleaned = "\n".join(line.rstrip() for line in data.split("\n"))
+        # v30: strip tmux grid-padding spaces from every line, but preserve
+        # the single space that follows a shell prompt marker ($ or #).
+        # That space is part of PS1/PS2, not tmux padding, and losing it
+        # causes the initial cursor to land on the marker itself.
+        stripped = []
+        for line in data.split("\n"):
+            line = line.rstrip()
+            if line.endswith("$") or line.endswith("#"):
+                line += " "
+            stripped.append(line)
+        cleaned = "\n".join(stripped)
         self.text.insert("end", cleaned)
         # v30: lightweight local cursor — placed at end of visible text.
         # If the user moved the cursor manually (arrow keys, typing, Backspace,
