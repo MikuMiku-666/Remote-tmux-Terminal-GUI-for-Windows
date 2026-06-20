@@ -937,11 +937,40 @@ class TerminalTab:
         # Do NOT reset _cursor_manually_placed here — we want the manual
         # position to survive multiple periodic snapshots.
         self._last_snapshot_data = data
+        self._sync_trailing_spaces_from_text()
         self._redraw_cursor_hint()
         self._start_cursor_blink()
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
         self._sync_bottom_input_from_remote(cmdline)
+
+    def _sync_trailing_spaces_from_text(self) -> None:
+        """Scan backward from end of last content line to count spaces.
+
+        Called after every snapshot to keep the counter in sync with the
+        actual text, regardless of how the cursor got there.
+        """
+        try:
+            total = int(self.text.index("end-1c").split(".")[0])
+            for line_n in range(total, max(1, total - 40), -1):
+                raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                if raw.strip():
+                    # Scan from before cursor cell backward
+                    end_idx = self.text.index(f"{line_n}.end - 2c")
+                    col = int(end_idx.split(".")[1]) if "." in str(end_idx) else 0
+                    count = 0
+                    for i in range(col, -1, -1):
+                        if i < len(raw) and raw[i] == " ":
+                            count += 1
+                        else:
+                            break
+                    self._user_trailing_spaces = count
+                    return
+            self._user_trailing_spaces = 0
+        except Exception:
+            self._user_trailing_spaces = 0
 
     def _normalize_cursor_index(self, index: str) -> str:
         """Return a safe Text index for the local overlay cursor."""
@@ -1003,7 +1032,25 @@ class TerminalTab:
                 if self.text.compare(idx, ">", editable_start):
                     idx = self.text.index(f"{idx} -1c")
                     if key == "BSpace":
-                        self._user_trailing_spaces = max(0, self._user_trailing_spaces - 1)
+                        # Scan left: the character at *idx* is being
+                        # deleted.  Count spaces immediately to its
+                        # left — these become trailing after deletion.
+                        try:
+                            scan = self.text.index(f"{idx} -1c")
+                            scan_line = int(scan.split(".")[0])
+                            scan_col = int(scan.split(".")[1])
+                            raw = self.text.get(f"{scan_line}.0", f"{scan_line}.end")
+                            if raw.endswith("\n"):
+                                raw = raw[:-1]
+                            count = 0
+                            for i in range(scan_col, -1, -1):
+                                if i < len(raw) and raw[i] == " ":
+                                    count += 1
+                                else:
+                                    break
+                            self._user_trailing_spaces = count
+                        except Exception:
+                            self._user_trailing_spaces = max(0, self._user_trailing_spaces - 1)
                 else:
                     return  # at boundary, no-op
             elif key == "Right":
