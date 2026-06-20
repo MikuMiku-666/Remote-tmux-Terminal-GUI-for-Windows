@@ -742,7 +742,6 @@ class TerminalTab:
         self._cursor_blink_after_id: Optional[str] = None
         self._last_snapshot_data = ""
         self._cursor_manually_placed = False
-        self._pane_width = 0
         self.text.tag_configure("local_cursor", background="#808080", underline=True)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
@@ -916,9 +915,20 @@ class TerminalTab:
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        # v30: store pane width from server for padding detection in _visible_end.
-        if cursor and cursor.get("width"):
-            self._pane_width = cursor["width"]
+        # v30: strip tmux grid-padding using pane_width.  Each line from
+        # capture-pane is padded to pane_width with trailing spaces (unless
+        # it wraps).  We rstrip those, then add one cursor cell per non-empty
+        # line.  After this, every space in the widget is a cursor cell and
+        # there is zero padding confusion.
+        pw = (cursor or {}).get("width", 0)
+        if pw > 0:
+            lines = []
+            for line in data.split("\n"):
+                line = line.rstrip()
+                if line:
+                    line += " "
+                lines.append(line)
+            data = "\n".join(lines)
         self.text.insert("end", data)
         # v30: lightweight local cursor — placed at end of visible text.
         # If the user moved the cursor manually (arrow keys, typing, Backspace,
@@ -1042,34 +1052,14 @@ class TerminalTab:
             return f"{line_n}.0"
 
     def _visible_end(self, line_n: int) -> str:
-        """Return the end of visible content on *line_n*, skipping tmux
-        grid padding but honouring user-typed spaces.
+        """Return the end-of-content position on *line_n*.
 
-        Uses the pane width from the server to detect padding: lines
-        shorter than pane_width are padded with trailing spaces by tmux.
-        When the cursor has been manually moved past the detected end
-        (because the user typed spaces), respect that position.
+        Tmux padding is stripped at snapshot time; every non-empty line
+        carries exactly one trailing cursor cell.  ``line.end - 1c`` is
+        that cell.
         """
         try:
-            raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
-            if raw.endswith("\n"):
-                raw = raw[:-1]
-            if self._pane_width and len(raw) <= self._pane_width:
-                col = len(raw.rstrip())
-            else:
-                col = len(raw)
-            # If the cursor is already past the detected end (user typed
-            # spaces), use the cursor position as the effective boundary.
-            try:
-                cur_line = int(self.cursor_index.split(".")[0])
-                cur_col = int(self.cursor_index.split(".")[1])
-                if cur_line == line_n and cur_col > col:
-                    col = cur_col
-            except Exception:
-                pass
-            if col > 0:
-                return f"{line_n}.{col}"
-            return f"{line_n}.0"
+            return self.text.index(f"{line_n}.end - 1c")
         except Exception:
             return f"{line_n}.0"
 
