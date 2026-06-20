@@ -742,6 +742,7 @@ class TerminalTab:
         self._cursor_blink_after_id: Optional[str] = None
         self._last_snapshot_data = ""
         self._cursor_manually_placed = False
+        self._user_trailing_spaces = 0
         self.text.tag_configure("local_cursor", background="#808080", underline=True)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
@@ -915,13 +916,16 @@ class TerminalTab:
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        # v30: always strip trailing spaces and add one cursor cell per
-        # non-empty line.  This removes tmux grid-padding unconditionally.
+        # v30: strip tmux padding, preserve user-typed trailing spaces
+        # (tracked by _user_trailing_spaces counter), and add one cursor
+        # cell per non-empty line.
+        keep_spaces = self._user_trailing_spaces
         lines = []
         for line in data.split("\n"):
             line = line.rstrip()
             if line:
-                line += " "
+                line += " " * keep_spaces
+                line += " "   # cursor cell
             lines.append(line)
         self.text.insert("end", "\n".join(lines))
         # v30: lightweight local cursor — placed at end of visible text.
@@ -998,6 +1002,8 @@ class TerminalTab:
                 # Don't move left past the editable start (after $ prompt).
                 if self.text.compare(idx, ">", editable_start):
                     idx = self.text.index(f"{idx} -1c")
+                    if key == "BSpace":
+                        self._user_trailing_spaces = max(0, self._user_trailing_spaces - 1)
                 else:
                     return  # at boundary, no-op
             elif key == "Right":
@@ -1014,10 +1020,15 @@ class TerminalTab:
             elif len(key) == 1 and key >= " ":
                 # Printable character — cursor advances by one column.
                 idx = self.text.index(f"{idx} +1c")
+                if key == " ":
+                    self._user_trailing_spaces += 1
+                else:
+                    self._user_trailing_spaces = 0
             elif key in {"Enter", "Escape", "Tab", "Up", "Down", "PageUp", "PageDown"}:
                 # Full content change — release manual cursor lock so the
                 # next snapshot resets to end-of-content.
                 self._cursor_manually_placed = False
+                self._user_trailing_spaces = 0
                 return
             self._cursor_manually_placed = True
             self._set_local_cursor(idx)
@@ -1107,7 +1118,7 @@ class TerminalTab:
                 line_text = raw.rstrip()[-20:]   # last 20 chars of visible text
             except Exception:
                 pass
-            self._cursor_pos_var.set(f"cur={idx}  end={end}  |...{line_text}")
+            self._cursor_pos_var.set(f"cur={idx}  end={end}  sp={self._user_trailing_spaces} |...{line_text}")
         except Exception:
             self._cursor_pos_var.set(f"cur={self.cursor_index}")
 
@@ -1258,6 +1269,7 @@ class TerminalTab:
         self._syncing_entry_from_remote = False
         self.entry_dirty_local = False
         self._cursor_manually_placed = False
+        self._user_trailing_spaces = 0
         self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
         return "break"
 
