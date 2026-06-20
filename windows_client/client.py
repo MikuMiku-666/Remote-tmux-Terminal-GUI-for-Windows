@@ -1407,6 +1407,8 @@ class TerminalTab:
         data = data.replace("\r\n", "\n").replace("\r", "\n")
         if data:
             self.entry_dirty_local = False
+            self._cursor_manually_placed = False
+            self._user_trailing_spaces = 0
             self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
             self.app.set_status(f"Pasted {len(data)} character(s) to remote terminal.")
         return "break"
