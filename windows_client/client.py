@@ -1043,13 +1043,16 @@ class TerminalTab:
             return f"{line_n}.0"
 
     def _visible_end(self, line_n: int) -> str:
-        """Return the visual end of *line_n*.
+        """Return the index of the last real character on *line_n*.
 
-        Padding spaces are already stripped when snapshot data is inserted,
-        so ``line.end`` is the genuine end of visible content.
-        ``_redraw_cursor_hint`` handles the newline boundary.
+        This is the character just before line.end (the newline).  Using
+        ``line.end`` directly would cause ``+1c`` to wrap to the next line
+        and break cursor tracking on trailing spaces.
         """
-        return f"{line_n}.end"
+        try:
+            return self.text.index(f"{line_n}.end - 1c")
+        except Exception:
+            return f"{line_n}.0"
 
     def _redraw_cursor_hint(self) -> None:
         """Render a visual cursor block at the current ``cursor_index`` position.
