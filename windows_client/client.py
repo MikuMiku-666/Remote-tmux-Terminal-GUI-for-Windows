@@ -1065,12 +1065,15 @@ class TerminalTab:
             elif key == "Delete":
                 pass  # cursor stays put, but mark as manually placed
             elif len(key) == 1 and key >= " ":
-                # Printable character — cursor advances by one column.
-                idx = self.text.index(f"{idx} +1c")
                 if key == " ":
                     self._user_trailing_spaces += 1
+                    # Stay on current line (auto-repeat could overflow).
+                    line_end = self.text.index(f"{cur_line}.end")
+                    if self.text.compare(idx, "<", line_end):
+                        idx = self.text.index(f"{idx} +1c")
                 else:
                     self._user_trailing_spaces = 0
+                    idx = self.text.index(f"{idx} +1c")
             elif key in {"Enter", "Escape", "Tab", "Up", "Down", "PageUp", "PageDown"}:
                 # Full content change — release manual cursor lock so the
                 # next snapshot resets to end-of-content.
