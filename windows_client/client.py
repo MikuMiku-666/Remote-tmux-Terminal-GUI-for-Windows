@@ -1407,8 +1407,19 @@ class TerminalTab:
         data = data.replace("\r\n", "\n").replace("\r", "\n")
         if data:
             self.entry_dirty_local = False
-            self._cursor_manually_placed = False
             self._user_trailing_spaces = 0
+            # Estimate new cursor position: advance by one-line content length.
+            # Multi-line paste falls back to end-of-content via snapshot.
+            single_line = data.split("\n")[0]
+            if single_line:
+                try:
+                    new_idx = self.text.index(f"{self.cursor_index} +{len(single_line)}c")
+                    self._set_local_cursor(new_idx)
+                    self._cursor_manually_placed = True
+                except Exception:
+                    self._cursor_manually_placed = False
+            else:
+                self._cursor_manually_placed = False
             self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
             self.app.set_status(f"Pasted {len(data)} character(s) to remote terminal.")
         return "break"
