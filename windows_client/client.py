@@ -736,8 +736,13 @@ class TerminalTab:
         # Tk can report a huge bbox for newline / line-end positions, which may
         # look like a long white line across the bottom of the terminal.  A tag
         # never inserts characters and never changes copied terminal content.
+        # v30: re-enabled local cursor with server-driven positioning.
         self.cursor_index = "end-1c"
-        self.text.tag_configure("local_cursor", background="#5a5a5a", underline=True)
+        self._cursor_visible = True
+        self._cursor_blink_after_id: Optional[str] = None
+        self._last_snapshot_data = ""
+        self._cursor_manually_placed = False
+        self.text.tag_configure("local_cursor", background="#808080")
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
@@ -772,6 +777,10 @@ class TerminalTab:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Select all", command=self.select_all_output)
 
+        self._cursor_pos_var = tk.StringVar(value="cur:?")
+        self._cursor_debug_label = ttk.Label(self.frame, textvariable=self._cursor_pos_var,
+                                              foreground="#888888", font=("Consolas", 9))
+        self._cursor_debug_label.pack(side="bottom", anchor="e", padx=4)
         bottom = ttk.Frame(self.frame)
         bottom.pack(side="bottom", fill="x")
         self.cmd_var = tk.StringVar()
@@ -897,7 +906,7 @@ class TerminalTab:
         try:
             self.text.yview_moveto(1.0)
             self.text.xview_moveto(0.0)
-            self.after_idle(self._redraw_cursor_hint)
+            self.text.after_idle(self._redraw_cursor_hint)
         except Exception:
             pass
 
@@ -907,12 +916,17 @@ class TerminalTab:
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("end", data)
-        # v28: local cursor rendering was unreliable in Tk Text.  The practical
-        # replacement is Linux-side current-command synchronization: when the
-        # user types in the black area or recalls history with Up/Down, the
-        # bottom input box mirrors the command currently shown by the remote
-        # shell/readline line.
-        self.text.tag_remove("local_cursor", "1.0", "end")
+        # v30: lightweight local cursor — placed at end of visible text.
+        # If the user moved the cursor manually (arrow keys, typing, Backspace,
+        # Delete), honour that position across ALL snapshots until a major
+        # content-changing key (Enter, Up/Down, Tab) resets the flag.
+        if not self._cursor_manually_placed:
+            self._set_local_cursor_to_end()
+        # Do NOT reset _cursor_manually_placed here — we want the manual
+        # position to survive multiple periodic snapshots.
+        self._last_snapshot_data = data
+        self._redraw_cursor_hint()
+        self._start_cursor_blink()
         self.text.configure(state="disabled")
         self._scroll_bottom_keep_left()
         self._sync_bottom_input_from_remote(cmdline)
@@ -938,71 +952,195 @@ class TerminalTab:
     def _set_local_cursor(self, index: str) -> None:
         self.cursor_index = self._normalize_cursor_index(index)
         self.text.mark_set("remote_cursor", self.cursor_index)
+        self._update_cursor_debug()
         self._redraw_cursor_hint()
 
     def _set_local_cursor_to_end(self) -> None:
-        """Place the local cursor at the end of the current terminal text.
-
-        This is a deliberate Windows-side estimate.  For normal shell usage the
-        visible cursor should be at the end of the current prompt/output line.
-        It is much more robust than trying to map tmux pane_cursor_y onto a
-        scrollback-heavy capture-pane snapshot.
+        """Place the local cursor at the end of visible text on the last
+        non-empty line, and release the manual-cursor lock.
         """
         try:
-            content_end = self.text.index("end-1c")
-            self._set_local_cursor(content_end)
+            total = int(self.text.index("end-1c").split(".")[0])
+            for line_n in range(total, max(1, total - 40), -1):
+                raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                if raw.rstrip():
+                    self._cursor_manually_placed = False
+                    self._set_local_cursor(self._visible_end(line_n))
+                    return
+            self._cursor_manually_placed = False
+            self._set_local_cursor("end-1c")
         except Exception:
             self.cursor_index = "1.0"
-
-    def _cursor_line_start(self) -> str:
-        try:
-            return self.text.index(f"{self.cursor_index} linestart")
-        except Exception:
-            return "end-1c linestart"
-
-    def _cursor_line_end(self) -> str:
-        try:
-            return self.text.index(f"{self.cursor_index} lineend")
-        except Exception:
-            return "end-1c lineend"
 
     def _move_local_cursor_key(self, key: str) -> None:
         """Update the local overlay for common editing/navigation keys.
 
-        The real shell remains authoritative and a snapshot will still correct
-        the text.  This is only a visual hint so the user can see where input is
-        expected, especially while waiting for the next pushed snapshot.
+        For keystrokes that change the edit buffer (typing, Backspace, Delete)
+        we estimate the new cursor column locally.  The server snapshot will
+        replace the text, but we keep the locally-planned position so the
+        cursor doesn't jump to end-of-content on every keystroke.
         """
         try:
             idx = self.cursor_index
+            cur_line = int(idx.split(".")[0])
+            editable_start = self._editable_start(cur_line)
+            visible_end = self._visible_end(cur_line)
+
             if key in {"Left", "BSpace"}:
-                line_start = self._cursor_line_start()
-                if self.text.compare(idx, ">", line_start):
+                # Don't move left past the editable start (after $ prompt).
+                if self.text.compare(idx, ">", editable_start):
                     idx = self.text.index(f"{idx} -1c")
+                else:
+                    return  # at boundary, no-op
             elif key == "Right":
-                line_end = self._cursor_line_end()
-                if self.text.compare(idx, "<", line_end):
+                if self.text.compare(idx, "<", visible_end):
                     idx = self.text.index(f"{idx} +1c")
+                else:
+                    return
             elif key == "Home":
-                idx = self._cursor_line_start()
+                idx = editable_start
             elif key == "End":
-                idx = self._cursor_line_end()
-            elif key in {"Enter", "Escape", "Tab", "Up", "Down", "PageUp", "PageDown", "Delete"}:
-                # Let the imminent snapshot decide these cases.
+                idx = visible_end
+            elif key == "Delete":
+                pass  # cursor stays put, but mark as manually placed
+            elif len(key) == 1 and key >= " ":
+                # Printable character — cursor advances by one column.
+                idx = self.text.index(f"{idx} +1c")
+            elif key in {"Enter", "Escape", "Tab", "Up", "Down", "PageUp", "PageDown"}:
+                # Full content change — release manual cursor lock so the
+                # next snapshot resets to end-of-content.
+                self._cursor_manually_placed = False
                 return
+            self._cursor_manually_placed = True
             self._set_local_cursor(idx)
         except Exception:
             pass
 
-    def _redraw_cursor_hint(self) -> None:
-        """v28 disables the unreliable local visual cursor.
+    def _editable_start(self, line_n: int) -> str:
+        """Return the index just after the shell prompt marker on *line_n*.
 
-        Earlier local/Tk-based cursor attempts either drifted away from the
-        remote readline buffer or rendered as a long line.  We keep this method
-        as a no-op cleanup so older calls are harmless.
+        A typical Ubuntu prompt looks like ``user@host:~$ command``.  The
+        editable portion starts after ``$ `` (or ``# `` for root).  We find
+        the last such marker on the line and place the cursor two columns
+        past it.  If no marker is found we fall back to column 0.
+        """
+        try:
+            raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
+            if raw.endswith("\n"):
+                raw = raw[:-1]
+            col = 0
+            for marker in ("$ ", "# "):
+                pos = raw.rfind(marker)
+                if pos > col:
+                    col = pos
+            if col > 0:
+                col += 2  # skip marker + space
+            return f"{line_n}.{col}"
+        except Exception:
+            return f"{line_n}.0"
+
+    def _visible_end(self, line_n: int) -> str:
+        """Return the index of the last non-space character on *line_n*.
+
+        Tmux capture-pane pads each row to pane width with trailing spaces.
+        ``line.end`` would land in that invisible padding.  We strip spaces
+        so the cursor sits at the actual visual end of the line.
+        """
+        try:
+            raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
+            if raw.endswith("\n"):
+                raw = raw[:-1]
+            stripped = raw.rstrip()
+            return f"{line_n}.{len(stripped)}"
+        except Exception:
+            return f"{line_n}.0"
+
+    def _redraw_cursor_hint(self) -> None:
+        """Render a visual cursor block at the current ``cursor_index`` position.
+
+        v30 re-enables the local cursor (v28 disabled it).  The tag covers one
+        character cell — no extra characters are inserted, no overlays.  The
+        cursor is placed at the end of terminal content (``end-1c``) by default
+        and follows local arrow-key feedback via ``_move_local_cursor_key``.
+        The next server snapshot resets it to end-of-content for accuracy.
+
+        We avoid tagging the trailing newline — Tk renders its background as a
+        wide block across the rest of the widget width.
         """
         try:
             self.text.tag_remove("local_cursor", "1.0", "end")
+            idx = self._normalize_cursor_index(self.cursor_index)
+            line_end = self.text.index(f"{idx.split('.')[0]}.end")
+
+            if self.text.compare(idx, ">=", line_end):
+                # Cursor at or past line end — tag last visible character.
+                last_char = self.text.index(f"{line_end} -1c")
+                if self.text.compare(last_char, ">=", f"{idx.split('.')[0]}.0"):
+                    self.text.tag_add("local_cursor", last_char, line_end)
+                # Otherwise the line is empty — skip, cursor will appear
+                # once the user types.
+            else:
+                end = f"{idx} +1c"
+                # Never extend past line.end — tagging the newline
+                # produces a wide gray block instead of a compact cursor.
+                if self.text.compare(end, ">", line_end):
+                    end = line_end
+                self.text.tag_add("local_cursor", idx, end)
+        except Exception:
+            pass
+
+    def _update_cursor_debug(self) -> None:
+        """Update the diagnostic cursor-position label."""
+        try:
+            idx = self._normalize_cursor_index(self.cursor_index)
+            end = self.text.index("end-1c")
+            line_text = ""
+            try:
+                ln = idx.split(".")[0]
+                raw = self.text.get(f"{ln}.0", f"{ln}.end")
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                line_text = raw.rstrip()[-20:]   # last 20 chars of visible text
+            except Exception:
+                pass
+            self._cursor_pos_var.set(f"cur={idx}  end={end}  |...{line_text}")
+        except Exception:
+            self._cursor_pos_var.set(f"cur={self.cursor_index}")
+
+    def _start_cursor_blink(self) -> None:
+        """Begin the cursor blink cycle."""
+        self._cursor_visible = True
+        if self._cursor_blink_after_id is None:
+            self._cursor_blink_after_id = self.text.after(530, self._toggle_cursor_blink)
+
+    def _toggle_cursor_blink(self) -> None:
+        """Toggle cursor visibility every ~530 ms."""
+        self._cursor_visible = not self._cursor_visible
+        try:
+            if self._cursor_visible:
+                self.text.tag_configure("local_cursor", background="#808080")
+            else:
+                self.text.tag_configure("local_cursor", background="")
+        except Exception:
+            pass
+        try:
+            self._cursor_blink_after_id = self.text.after(530, self._toggle_cursor_blink)
+        except Exception:
+            self._cursor_blink_after_id = None
+
+    def _stop_cursor_blink(self) -> None:
+        """Cancel the blink timer and restore a solid cursor."""
+        if self._cursor_blink_after_id is not None:
+            try:
+                self.text.after_cancel(self._cursor_blink_after_id)
+            except Exception:
+                pass
+            self._cursor_blink_after_id = None
+        self._cursor_visible = True
+        try:
+            self.text.tag_configure("local_cursor", background="#808080")
         except Exception:
             pass
 
@@ -1117,6 +1255,7 @@ class TerminalTab:
         self.cmd_var.set("")
         self._syncing_entry_from_remote = False
         self.entry_dirty_local = False
+        self._cursor_manually_placed = False
         self._send_message({"type": "input", "data": data}, fallback_endpoint="input")
         return "break"
 
@@ -1259,6 +1398,8 @@ class TerminalTab:
         ch = event.char
         if ch and ch >= " " and ch != "\x7f":
             self.entry_dirty_local = False
+            # v30: move local cursor right by 1 for the inserted character
+            self._move_local_cursor_key(ch)
             self._send_message({"type": "input", "data": ch}, fallback_endpoint="input")
             return "break"
         return "break"
@@ -1299,6 +1440,7 @@ class TerminalTab:
         threading.Thread(target=worker, name=f"fallback-post-{self.term_id}-{endpoint}", daemon=True).start()
 
     def detach(self) -> None:
+        self._stop_cursor_blink()
         self.stop_event.set()
         with self.ws_lock:
             ws = self.ws
