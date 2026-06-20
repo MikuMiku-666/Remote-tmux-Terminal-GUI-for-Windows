@@ -742,7 +742,7 @@ class TerminalTab:
         self._cursor_blink_after_id: Optional[str] = None
         self._last_snapshot_data = ""
         self._cursor_manually_placed = False
-        self.text.tag_configure("local_cursor", background="#808080")
+        self.text.tag_configure("local_cursor", background="#808080", underline=True)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
         self.h_scroll.grid(row=1, column=0, sticky="ew")
@@ -915,7 +915,12 @@ class TerminalTab:
         self.suppress_output_until = 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        self.text.insert("end", data)
+        # v30: strip tmux grid-padding spaces from every line.  Tmux
+        # capture-pane pads each row to the full pane width with trailing
+        # spaces.  These are invisible filler and interfere with cursor
+        # positioning (we can't tell user-typed spaces from padding).
+        cleaned = "\n".join(line.rstrip() for line in data.split("\n"))
+        self.text.insert("end", cleaned)
         # v30: lightweight local cursor — placed at end of visible text.
         # If the user moved the cursor manually (arrow keys, typing, Backspace,
         # Delete), honour that position across ALL snapshots until a major
@@ -956,16 +961,12 @@ class TerminalTab:
         self._redraw_cursor_hint()
 
     def _set_local_cursor_to_end(self) -> None:
-        """Place the local cursor at the end of visible text on the last
-        non-empty line, and release the manual-cursor lock.
-        """
+        """Place cursor at end of last non-blank line; release manual lock."""
         try:
             total = int(self.text.index("end-1c").split(".")[0])
             for line_n in range(total, max(1, total - 40), -1):
                 raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
-                if raw.endswith("\n"):
-                    raw = raw[:-1]
-                if raw.rstrip():
+                if raw.strip():
                     self._cursor_manually_placed = False
                     self._set_local_cursor(self._visible_end(line_n))
                     return
@@ -1042,20 +1043,13 @@ class TerminalTab:
             return f"{line_n}.0"
 
     def _visible_end(self, line_n: int) -> str:
-        """Return the index of the last non-space character on *line_n*.
+        """Return the visual end of *line_n*.
 
-        Tmux capture-pane pads each row to pane width with trailing spaces.
-        ``line.end`` would land in that invisible padding.  We strip spaces
-        so the cursor sits at the actual visual end of the line.
+        Padding spaces are already stripped when snapshot data is inserted,
+        so ``line.end`` is the genuine end of visible content.
+        ``_redraw_cursor_hint`` handles the newline boundary.
         """
-        try:
-            raw = self.text.get(f"{line_n}.0", f"{line_n}.end")
-            if raw.endswith("\n"):
-                raw = raw[:-1]
-            stripped = raw.rstrip()
-            return f"{line_n}.{len(stripped)}"
-        except Exception:
-            return f"{line_n}.0"
+        return f"{line_n}.end"
 
     def _redraw_cursor_hint(self) -> None:
         """Render a visual cursor block at the current ``cursor_index`` position.
@@ -1120,7 +1114,7 @@ class TerminalTab:
         self._cursor_visible = not self._cursor_visible
         try:
             if self._cursor_visible:
-                self.text.tag_configure("local_cursor", background="#808080")
+                self.text.tag_configure("local_cursor", background="#808080", underline=True)
             else:
                 self.text.tag_configure("local_cursor", background="")
         except Exception:
@@ -1140,7 +1134,7 @@ class TerminalTab:
             self._cursor_blink_after_id = None
         self._cursor_visible = True
         try:
-            self.text.tag_configure("local_cursor", background="#808080")
+            self.text.tag_configure("local_cursor", background="#808080", underline=True)
         except Exception:
             pass
 
