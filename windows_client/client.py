@@ -743,6 +743,7 @@ class TerminalTab:
         self._last_snapshot_data = ""
         self._cursor_manually_placed = False
         self._user_trailing_spaces = 0
+        self._last_paste_time = 0.0
         self.text.tag_configure("local_cursor", background="#808080", underline=True)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.v_scroll.grid(row=0, column=1, sticky="ns")
@@ -1399,6 +1400,11 @@ class TerminalTab:
         return "break"
 
     def paste_clipboard_to_remote(self) -> str:
+        # Windows may fire both <Control-v> and <<Paste>> for the same
+        # keystroke.  Debounce to avoid double paste + cursor advance.
+        if time.monotonic() - self._last_paste_time < 0.15:
+            return "break"
+        self._last_paste_time = time.monotonic()
         try:
             data = self.app.clipboard_get()
         except Exception:
@@ -1408,8 +1414,8 @@ class TerminalTab:
         if data:
             self.entry_dirty_local = False
             self._user_trailing_spaces = 0
-            # Estimate new cursor position: advance by one-line content length.
-            # Multi-line paste falls back to end-of-content via snapshot.
+            # Estimate new cursor position: advance by first-line length.
+            # Multi-line paste: the snapshot corrects any mismatch.
             single_line = data.split("\n")[0]
             if single_line:
                 try:
