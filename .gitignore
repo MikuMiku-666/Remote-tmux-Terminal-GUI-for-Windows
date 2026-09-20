@@ -1,5 +1,7 @@
 # Windows scripts
 *.bat
+!windows_client/run_client.bat
+!windows_client/build_windows_exe.bat
 
 # Python virtual environments
 .venv/
