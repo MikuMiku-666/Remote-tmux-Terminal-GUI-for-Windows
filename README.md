@@ -1,214 +1,216 @@
 # Remote tmux Terminal GUI for Windows v31
 
+**English** | [简体中文](README.zh-CN.md)
+
 ![Remote tmux Terminal GUI](UI.jpg)
 
-Remote tmux Terminal GUI 是一个轻量级 Windows 图形终端。Windows 客户端通过
-OpenSSH 端口转发连接 Linux 服务端，Linux 端使用 tmux 保存终端和正在运行的任务。
+Remote tmux Terminal GUI is a lightweight Windows interface for persistent Linux terminals. The Windows client connects through an OpenSSH local port forward, while tmux on the Linux server owns the terminal sessions and running processes.
 
-关闭 Windows 客户端只会断开显示，不会停止训练、服务或其他远程命令。重新连接后，
-可以继续查看并操作已有 tmux 终端。
+Closing the Windows client only detaches the display. Training jobs, servers, and other remote commands continue running, and the client can reconnect to the existing terminals later.
 
-## 主要功能
+## Features
 
-- 使用 Windows 自带的 `ssh.exe` 建立安全的本地端口转发；
-- Linux 端通过 tmux 保存持久终端；
-- WebSocket 实时推送终端输出；
-- 断线重连后自动恢复已有终端；
-- 支持多个终端标签页和批量关闭远程终端；
-- 支持直接在黑色终端区域输入，也支持底部命令输入框；
-- 支持 Enter、Backspace、Tab、方向键、Home、End、Delete、Esc；
-- 支持 Ctrl-C、Ctrl-D、Ctrl-Z、Ctrl-L、Ctrl-V 等常用组合键；
-- 支持 Windows 剪贴板复制和粘贴；
-- 支持设置新终端的默认 Linux 工作目录；
-- 支持调整终端字体大小并自动保存；
-- 支持保存 SSH 主机、端口、用户名、密钥路径等连接信息；
-- 密码可使用 Windows DPAPI 加密保存；
-- 可选择隐藏 `ssh.exe` 控制台窗口；
-- 可打包成不依赖目标机器 Python 环境的 Windows EXE。
+- Secure local port forwarding through the Windows built-in `ssh.exe`;
+- persistent Linux terminals managed by tmux;
+- real-time terminal output over WebSocket;
+- automatic reattachment to existing terminals after reconnecting;
+- multiple terminal tabs and batch remote-session closing;
+- direct typing in the terminal view and a separate command input box;
+- Enter, Backspace, Tab, arrow keys, Home, End, Delete, and Esc;
+- common control keys including Ctrl-C, Ctrl-D, Ctrl-Z, Ctrl-L, and Ctrl-V;
+- Windows clipboard copy and paste;
+- configurable initial Linux directory for new terminals;
+- adjustable terminal font size with automatic persistence;
+- saved SSH host, port, username, key path, and connection settings;
+- optional Windows DPAPI-encrypted password storage;
+- optional hidden `ssh.exe` console window;
+- packaging as a standalone Windows executable.
 
-## v31 光标改进
+## v31 cursor improvements
 
-v31 不再完全依赖 Windows 客户端猜测光标位置，而是以 tmux 的屏幕状态为准：
+v31 treats the tmux screen as authoritative instead of relying entirely on Windows-side cursor prediction:
 
-- 保留 tmux 的物理行，不再用 `capture-pane -J` 合并自动换行；
-- 快照携带光标所在的快照行、终端显示列和 Tk 字符索引；
-- 支持中文、全角字符、组合字符和 Emoji ZWJ 字素簇的列宽换算；
-- 本地按键预测只用于降低网络往返期间的视觉延迟；
-- 收到服务端快照后，立即以远端真实坐标校正光标；
-- Windows 窗口或字体变化时，自动同步 tmux 的行数和列数。
+- tmux physical rows are preserved instead of being joined with `capture-pane -J`;
+- snapshots carry the cursor's snapshot row, terminal display column, and Tk character index;
+- width conversion supports Chinese and other wide characters, combining characters, and Emoji ZWJ grapheme clusters;
+- local prediction is used only to hide network round-trip latency;
+- every server snapshot corrects the cursor to the remote authoritative position;
+- tmux rows and columns are synchronized when the Windows terminal area or font size changes.
 
-这能显著改善普通 Shell、中文命令、长命令换行、历史命令和方向键编辑中的光标错位。
+These changes significantly reduce cursor drift in regular shells, Chinese commands, wrapped command lines, history recall, and arrow-key editing.
 
-## 工作原理
+## Architecture
 
 ```text
 Windows GUI
     |
-    | Windows ssh.exe 本地端口转发
+    | Windows ssh.exe local port forwarding
     v
-Linux FastAPI / WebSocket 服务
+Linux FastAPI / WebSocket service
     |
     | tmux new-session / send-keys / capture-pane
     v
-持久化 tmux 终端和远程任务
+Persistent tmux terminals and remote processes
 ```
 
 ```text
-关闭 Windows 客户端    -> 仅断开连接，远程任务继续运行
-重新打开客户端          -> 重新连接已有 tmux 终端
-点击 Close Remote      -> 真正关闭选中的远程 tmux 会话
+Close the Windows client  -> detach only; remote processes continue
+Reopen the client         -> reconnect to existing tmux terminals
+Click Close Remote        -> terminate the selected remote tmux sessions
 ```
 
-## 项目结构
+## Project layout
 
 ```text
 Remote-tmux-Terminal-GUI-for-Windows/
 ├── server/
-│   ├── server.py           # v31 服务端入口
-│   ├── base_server.py      # 完整服务端功能
-│   ├── protocol.py         # Unicode 列宽和光标协议
+│   ├── server.py           # v31 server entry point
+│   ├── base_server.py      # complete server behavior
+│   ├── protocol.py         # Unicode width and cursor protocol
 │   ├── requirements.txt
-│   └── start_server.sh     # 一键创建环境并启动
+│   └── start_server.sh     # one-command environment setup and launch
 ├── windows_client/
-│   ├── client.py           # v31 Windows 入口
-│   ├── base_client.py      # 完整 GUI、SSH 和终端功能
+│   ├── client.py           # v31 Windows entry point
+│   ├── base_client.py      # complete GUI, SSH, and terminal behavior
 │   ├── run_client.bat
 │   ├── build_windows_exe.bat
 │   └── RemoteTmuxTerminal-v31.spec
 ├── tests/
 │   └── test_protocol.py
 ├── UI.jpg
-└── README.md
+├── README.md
+└── README.zh-CN.md
 ```
 
-## Linux 服务端
+## Linux server
 
-### 系统要求
+### System requirements
 
-Debian 或 Ubuntu：
+On Debian or Ubuntu:
 
 ```bash
 sudo apt update
 sudo apt install tmux python3 python3-venv
 ```
 
-### 一键启动
+### One-command startup
 
-进入项目根目录后执行：
+From the repository root, run:
 
 ```bash
 bash server/start_server.sh
 ```
 
-首次运行时，脚本会在 `server/.venv` 创建独立 Python 环境，安装 FastAPI、Uvicorn、
-Pydantic 和 `wcwidth`，然后启动服务。后续会复用该环境，只有依赖清单变化时才重新安装，
-不会污染系统 Python、Conda 环境或训练环境。
+On its first run, the script creates an isolated environment at `server/.venv`, installs FastAPI, Uvicorn, Pydantic, and `wcwidth`, and then starts the server. Later launches reuse the environment and reinstall dependencies only when the requirements file changes. This does not modify the system Python, a Conda environment, or your training environment.
 
-默认监听 `127.0.0.1:8765`。建议只通过 SSH 端口转发访问，不要直接暴露到公网。
+The default listener is `127.0.0.1:8765`. Keep it bound to localhost and access it through the SSH tunnel rather than exposing it directly to the internet.
 
-使用其他端口：
+To use a different port:
 
 ```bash
 bash server/start_server.sh --port 8766
 ```
 
-检查服务：
+Health check:
 
 ```bash
 curl http://127.0.0.1:8765/health
 ```
 
-### 长期运行
+### Long-running server
+
+Run the service in a dedicated tmux session:
 
 ```bash
-tmux new -s rterm_server_v31
-cd /你的项目目录
+tmux new -s rterm_server
+cd /path/to/this/project
 bash server/start_server.sh
 ```
 
-按 `Ctrl+B`，松开后按 `D`，即可退出界面但保持服务运行。重新进入：
+Press `Ctrl+B`, release it, and then press `D` to detach without stopping the service. Reattach later with:
 
 ```bash
-tmux attach -t rterm_server_v31
+tmux attach -t rterm_server
 ```
 
-训练任务使用的 `rterm_xxxxxxxxxxxx` 会话和服务端会话相互独立。重启 FastAPI 服务不会
-终止这些训练任务。
+Training sessions named like `rterm_xxxxxxxxxxxx` are independent of the server session. Restarting the FastAPI service does not stop those training processes.
 
-## Windows 客户端
+## Windows client
 
-### 从源码运行
+### Run from source
 
-Windows 需要安装 Python 和 Windows OpenSSH Client：
+Windows needs Python and the Windows OpenSSH Client:
 
 ```bat
 ssh -V
 windows_client\run_client.bat
 ```
 
-客户端源码只使用 Python 标准库，不需要 Paramiko、Cryptography 等第三方库。
+The client source uses only the Python standard library. Paramiko, Cryptography, and other third-party client packages are not required.
 
-### 构建独立 EXE
+### Build a standalone EXE
+
+The build machine needs Python and PyInstaller:
 
 ```bat
 python -m pip install pyinstaller
 windows_client\build_windows_exe.bat
 ```
 
-输出文件：
+Output:
 
 ```text
 windows_client\dist\RemoteTmuxTerminal-v31.exe
 ```
 
-目标机器不需要安装 Python，但仍需要 Windows OpenSSH Client。
+The target Windows machine does not need Python, but it still needs the Windows OpenSSH Client.
 
-## 连接设置
+## Connection settings
 
 ```text
-SSH Host                 Linux 主机地址
-SSH Port                 SSH 端口，通常为 22
-Username                 Linux 用户名
-Private key path         SSH 私钥路径
-Password                 可选，可用 DPAPI 加密保存
-Remote service port      服务端口，默认 8765
-Default terminal dir     新建终端的默认目录
-Hide ssh.exe window      隐藏 SSH 控制台窗口
-Font size                终端字体大小
+SSH Host                 Linux host name or address
+SSH Port                 SSH port, normally 22
+Username                 Linux user name
+Private key path         SSH private-key path
+Password                 Optional; may be encrypted with DPAPI
+Remote service port      Server port, default 8765
+Default terminal dir     Initial directory for new terminals
+Hide ssh.exe window      Hide the SSH console window
+Font size                Terminal font size
 ```
 
-配置保存在：
+Configuration is stored at:
 
 ```text
 %APPDATA%\RemoteTmuxTerminal\client_config.json
 ```
 
-密码由 Windows DPAPI 绑定到当前 Windows 用户。推荐优先使用 SSH 密钥或 ssh-agent。
-使用需要交互输入的密码时不建议隐藏 SSH 窗口；保存密码后可通过 `SSH_ASKPASS` 认证。
+Saved passwords are protected by Windows DPAPI and bound to the current Windows user. SSH keys or ssh-agent are recommended. Do not hide the SSH window when an interactive password prompt is required; a saved password can instead be supplied through `SSH_ASKPASS`.
 
-## 默认远程目录
+## Default remote directory
 
-设置默认目录后，新建终端会先启动正常的登录式 Shell，再发送：
+When a default directory is configured, a new terminal first starts its normal login-like shell and then receives:
 
 ```bash
 cd -- /your/default/path
 ```
 
-Shell 初始化、环境变量和 Conda 初始化会先正常完成。该设置只影响新建终端，不会移动
-已经存在的 tmux 会话。
+This allows shell initialization, environment variables, and Conda initialization to complete first. The setting affects only new terminals and does not move existing tmux sessions.
 
-## 常用操作
+## Common controls
+
+Type directly in the black terminal area, or enter a complete command in the bottom input box and click Send.
 
 ```text
-Ctrl + Plus / Ctrl + Minus    调整字体
-Ctrl + C                      有选区时复制，否则发送中断
-Ctrl + V                      粘贴 Windows 剪贴板
-Ctrl + Alt + V                向远端发送原始 Ctrl-V
-Ctrl + Click                  多选远程终端
-Shift + Click                 连续选择终端
+Ctrl + Plus / Ctrl + Minus    Change terminal font size
+Ctrl + C                      Copy a selection, otherwise send interrupt
+Ctrl + V                      Paste the Windows clipboard
+Ctrl + Alt + V                Send a raw Ctrl-V to the remote terminal
+Ctrl + Click                  Select or unselect a remote terminal
+Shift + Click                 Select a range of terminals
 ```
 
-长期任务示例：
+Example long-running workflow:
 
 ```bash
 conda activate myenv
@@ -216,22 +218,23 @@ cd /data/my_project
 python train.py
 ```
 
-关闭 Windows 客户端不会停止该命令，之后重新启动即可继续查看。
+Closing the Windows client does not stop the command. Start the client again to reconnect and continue monitoring it.
 
-## 测试
+## Tests
+
+Run the cursor-protocol tests with:
 
 ```bash
 python -m unittest discover -s tests -p "test_protocol.py" -v
 ```
 
-建议手工检查 ASCII、中文、Emoji、组合字符、左右方向键、Home/End、命令历史、长命令
-换行、空提示符、字体变化和窗口缩放。
+Recommended manual cases include ASCII, Chinese text, Emoji, combining characters, left/right arrows, Home/End, command history, wrapped commands, empty prompts, font-size changes, and window resizing.
 
-## 限制与安全说明
+## Limitations and security
 
-- 这是面向持久任务和常规 Shell 操作的轻量终端，不是完整的 xterm 实现；
-- `vim`、`htop`、`less` 等复杂全屏 TUI 可能仍有样式或局部刷新差异；
-- v31 解决了主要光标坐标问题，但客户端不会完整还原全部 ANSI 样式；
-- 服务端应监听 `127.0.0.1` 并通过 SSH 转发访问；
-- `Close Remote` 会真正终止远程 tmux 会话，使用前请确认没有重要任务；
-- 日常关闭窗口只会分离连接，不会终止远程任务。
+- This is a lightweight terminal intended for persistent jobs and regular shell usage, not a complete xterm implementation.
+- Complex full-screen TUIs such as `vim`, `htop`, and `less` may still have styling or partial-redraw differences.
+- v31 fixes the primary cursor-coordinate problems, but the client does not reproduce every ANSI style.
+- Keep the server bound to `127.0.0.1` and access it through SSH forwarding.
+- `Close Remote` really terminates the remote tmux session; verify that it contains no important job first.
+- Closing the application window only detaches and does not terminate remote work.
